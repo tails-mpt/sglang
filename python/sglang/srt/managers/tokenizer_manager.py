@@ -1367,6 +1367,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
+            if obj.rid is None:
+                return  # No request ID to abort
             if obj.is_single:
                 self.abort_request(obj.rid)
             else:
