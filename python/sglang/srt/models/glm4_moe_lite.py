@@ -28,6 +28,8 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+# Import batch_overlap first to resolve circular import with linear.py
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
