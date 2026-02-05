@@ -357,6 +357,21 @@ class ModelConfig:
                 mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                 self.scaling = self.scaling * mscale * mscale
 
+        elif (
+            "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
+            or "Glm4MoeForCausalLM" in self.hf_config.architectures
+        ):
+            # GLM-4.7-Flash uses MLA architecture internally but we use MHA backend
+            # with expanded dimensions since proper MLA latent KV caching is not implemented
+            self.head_dim = self.hf_config.qk_nope_head_dim + self.hf_config.qk_rope_head_dim  # 256
+            self.attention_arch = AttentionArch.MHA
+            # Store MLA params for use in attention layer
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.v_head_dim = self.hf_config.v_head_dim
+            self.q_lora_rank = self.hf_config.q_lora_rank
+
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
