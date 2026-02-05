@@ -247,6 +247,7 @@ class GenerateReqInput(BaseReq):
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
+        self._normalize_input_formats()
         self._validate_inputs()
         self._determine_batch_size()
         self._handle_parallel_sampling()
@@ -255,6 +256,16 @@ class GenerateReqInput(BaseReq):
             self._normalize_single_inputs()
         else:
             self._normalize_batch_inputs()
+
+    def _normalize_input_formats(self):
+        """Convert input_ids from various formats (BatchEncoding, tensor) to list."""
+        if self.input_ids is not None:
+            # Handle BatchEncoding from transformers
+            if hasattr(self.input_ids, 'input_ids'):
+                self.input_ids = self.input_ids.input_ids
+            # Handle tensors
+            if hasattr(self.input_ids, 'tolist'):
+                self.input_ids = self.input_ids.tolist()
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
@@ -366,6 +377,8 @@ class GenerateReqInput(BaseReq):
                 raise ValueError("Text should be a list for batch processing.")
             self.text = self.text * self.parallel_sample_num
         elif self.input_ids is not None:
+            # At this point, input_ids should already be in batch format (list of lists)
+            # from _handle_parallel_sampling if needed
             if not isinstance(self.input_ids, list) or not isinstance(
                 self.input_ids[0], list
             ):
