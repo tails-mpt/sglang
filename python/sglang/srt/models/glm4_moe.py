@@ -51,8 +51,10 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -320,6 +322,196 @@ class Glm4MoeAttention(nn.Module):
             forward_batch=forward_batch,
         )
         return self.forward_core(s)
+
+
+class Glm4MoeAttentionMLA(nn.Module):
+    """
+    Multi-head Latent Attention (MLA) for GLM-4.7-Flash.
+    Based on DeepSeek V2 MLA implementation.
+
+    GLM-4.7-Flash uses MLA with:
+    - q_a_proj: hidden_size -> q_lora_rank
+    - q_a_layernorm: LayerNorm on q_lora_rank
+    - q_b_proj: q_lora_rank -> num_heads * qk_head_dim
+    - kv_a_proj_with_mqa: hidden_size -> kv_lora_rank + qk_rope_head_dim
+    - kv_a_layernorm: LayerNorm on kv_lora_rank
+    - kv_b_proj: kv_lora_rank -> num_heads * (qk_nope_head_dim + v_head_dim)
+    """
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        layer_id: int = 0,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self.hidden_size = hidden_size
+
+        # MLA config parameters
+        self.q_lora_rank = config.q_lora_rank
+        self.kv_lora_rank = config.kv_lora_rank
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.v_head_dim = config.v_head_dim
+
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+
+        self.num_heads = num_heads
+        assert num_heads % attn_tp_size == 0
+        self.num_local_heads = num_heads // attn_tp_size
+        self.scaling = self.qk_head_dim ** -0.5
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+
+        rms_norm_eps = config.rms_norm_eps
+
+        # Query path: hidden -> q_lora_rank -> num_heads * qk_head_dim
+        self.q_a_proj = ReplicatedLinear(
+            self.hidden_size,
+            self.q_lora_rank,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("q_a_proj", prefix),
+        )
+        self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=rms_norm_eps)
+        self.q_b_proj = ColumnParallelLinear(
+            self.q_lora_rank,
+            self.num_heads * self.qk_head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("q_b_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+        )
+
+        # KV path: hidden -> kv_lora_rank + qk_rope_head_dim -> num_heads * (qk_nope_head_dim + v_head_dim)
+        self.kv_a_proj_with_mqa = ReplicatedLinear(
+            self.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("kv_a_proj_with_mqa", prefix),
+        )
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=rms_norm_eps)
+        self.kv_b_proj = ColumnParallelLinear(
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("kv_b_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+        )
+
+        # Output projection
+        self.o_proj = RowParallelLinear(
+            self.num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=False,
+            prefix=add_prefix("o_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+        )
+
+        # RoPE - GLM uses interleaved style (is_neox_style=False)
+        self.rotary_emb = get_rope(
+            self.qk_rope_head_dim,
+            rotary_dim=self.qk_rope_head_dim,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+            is_neox_style=False,
+        )
+
+        # Attention
+        self.attn = RadixAttention(
+            self.num_local_heads,
+            self.qk_head_dim,
+            self.scaling,
+            num_kv_heads=self.num_local_heads,  # MLA effectively has same Q and KV heads after expansion
+            layer_id=layer_id,
+            v_head_dim=self.v_head_dim,
+            prefix=add_prefix("attn", prefix),
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        # Query path
+        q_compressed, _ = self.q_a_proj(hidden_states)
+        q_compressed = self.q_a_layernorm(q_compressed)
+        q, _ = self.q_b_proj(q_compressed)
+
+        # KV path
+        kv_compressed, _ = self.kv_a_proj_with_mqa(hidden_states)
+        # Split: first kv_lora_rank dims go through layernorm, last qk_rope_head_dim are k_rope
+        kv_compressed_for_norm = kv_compressed[..., :self.kv_lora_rank]
+        k_rope = kv_compressed[..., self.kv_lora_rank:]
+
+        kv_compressed_normed = self.kv_a_layernorm(kv_compressed_for_norm)
+        kv, _ = self.kv_b_proj(kv_compressed_normed)
+
+        # Reshape q: (batch*seq, num_local_heads * qk_head_dim) -> (batch*seq, num_local_heads, qk_head_dim)
+        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
+        q_nope, q_rope = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        # Make contiguous after split (split returns non-contiguous views)
+        q_nope = q_nope.contiguous()
+        q_rope = q_rope.contiguous()
+
+        # Reshape kv: split into k_nope and v
+        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        # Make contiguous after split
+        k_nope = k_nope.contiguous()
+        v = v.contiguous()
+
+        # k_rope is shared across heads (single head from MQA), keep as (tokens, 1, rope_dim)
+        k_rope = k_rope.view(-1, 1, self.qk_rope_head_dim).contiguous()
+
+        # Apply RoPE to rope portions
+        # RoPE expects (tokens, num_heads * head_dim) format
+        # q_rope: (tokens, num_heads, rope_dim) -> (tokens, num_heads * rope_dim)
+        # k_rope: (tokens, 1, rope_dim) -> (tokens, rope_dim)
+        q_rope_for_rope = q_rope.view(-1, self.num_local_heads * self.qk_rope_head_dim)
+        k_rope_for_rope = k_rope.view(-1, self.qk_rope_head_dim)
+
+        q_rope_rotated, k_rope_rotated = self.rotary_emb(positions, q_rope_for_rope, k_rope_for_rope)
+
+        # Reshape back
+        q_rope = q_rope_rotated.view(-1, self.num_local_heads, self.qk_rope_head_dim)
+        # k_rope is shared, expand to all heads and make contiguous (expand creates non-contiguous)
+        k_rope = k_rope_rotated.view(-1, 1, self.qk_rope_head_dim).expand(-1, self.num_local_heads, -1).contiguous()
+
+        # Concatenate nope and rope parts
+        q = torch.cat([q_nope, q_rope], dim=-1)
+        k = torch.cat([k_nope, k_rope], dim=-1)
+
+        # Flatten for attention - shape: (tokens, num_heads * head_dim)
+        q = q.view(-1, self.num_local_heads * self.qk_head_dim)
+        k = k.view(-1, self.num_local_heads * self.qk_head_dim)
+        v = v.view(-1, self.num_local_heads * self.v_head_dim)
+
+        # Attention
+        attn_output = self.attn(q, k, v, forward_batch)
+
+        # Output projection
+        output, _ = self.o_proj(attn_output)
+        return output
 
 
 class Glm4MoeGate(nn.Module):
@@ -691,23 +883,40 @@ class Glm4MoeDecoderLayer(nn.Module):
         attention_bias = config.attention_bias
         self.layer_id = layer_id
 
-        self.self_attn = Glm4MoeAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            partial_rotary_factor=partial_rotary_factor,
-            max_position_embeddings=max_position_embeddings,
-            head_dim=head_dim,
-            rms_norm_eps=rms_norm_eps,
-            attention_bias=attention_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
-            use_qk_norm=config.use_qk_norm,
-            alt_stream=alt_stream,
-        )
+        # Use MLA attention if config has q_lora_rank (GLM-4.7-Flash uses MLA)
+        use_mla = hasattr(config, 'q_lora_rank') and config.q_lora_rank is not None
+
+        if use_mla:
+            self.self_attn = Glm4MoeAttentionMLA(
+                config=config,
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                layer_id=layer_id,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                quant_config=quant_config,
+                prefix=add_prefix("self_attn", prefix),
+            )
+        else:
+            self.self_attn = Glm4MoeAttention(
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                layer_id=layer_id,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                partial_rotary_factor=partial_rotary_factor,
+                max_position_embeddings=max_position_embeddings,
+                head_dim=head_dim,
+                rms_norm_eps=rms_norm_eps,
+                attention_bias=attention_bias,
+                quant_config=quant_config,
+                prefix=add_prefix("self_attn", prefix),
+                use_qk_norm=getattr(config, 'use_qk_norm', False),
+                alt_stream=alt_stream,
+            )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
@@ -1103,14 +1312,24 @@ class Glm4MoeForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
+        # Check if using MLA (GLM-4.7-Flash)
+        use_mla = hasattr(self.config, 'q_lora_rank') and self.config.q_lora_rank is not None
+
+        if use_mla:
+            # For MLA, no QKV stacking needed - weights are loaded directly
+            stacked_params_mapping = [
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ]
+        else:
+            stacked_params_mapping = [
+                # (param_name, shard_name, shard_id)
+                ("qkv_proj", "q_proj", "q"),
+                ("qkv_proj", "k_proj", "k"),
+                ("qkv_proj", "v_proj", "v"),
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ]
 
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
@@ -1276,4 +1495,10 @@ class Glm4MoeForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
-EntryClass = [Glm4MoeForCausalLM]
+# GLM-4.7-Flash (GLM-4 MoE Lite) - wrapper class using same implementation
+class Glm4MoeLiteForCausalLM(Glm4MoeForCausalLM):
+    """GLM-4.7-Flash model - uses same implementation as Glm4MoeForCausalLM"""
+    pass
+
+
+EntryClass = [Glm4MoeForCausalLM, Glm4MoeLiteForCausalLM]

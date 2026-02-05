@@ -184,6 +184,40 @@ def _load_deepseek_v32_model(
     )
 
 
+def _load_glm4_moe_lite_config(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    """Load GLM-4.7-Flash config by mapping glm4_moe_lite to glm4_moe model_type.
+
+    GLM-4.7-Flash uses model_type 'glm4_moe_lite' which transformers doesn't recognize.
+    Map to 'glm4_moe' for config loading; SGLang uses architectures field for model selection.
+    """
+    local_path = download_from_hf(model_path)
+    config_file = os.path.join(local_path, "config.json")
+    if not os.path.exists(config_file):
+        raise RuntimeError(f"Can't find config file in {local_path}.")
+
+    with open(config_file, "r") as f:
+        config_json = json.load(f)
+
+    # Keep architectures as Glm4MoeLiteForCausalLM, only change model_type for transformers
+    config_json["model_type"] = "glm4_moe"
+
+    tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
+    os.makedirs(tmp_path, exist_ok=True)
+
+    unique_path = os.path.join(tmp_path, f"glm4_moe_lite_{os.getpid()}")
+    with open(unique_path, "w") as f:
+        json.dump(config_json, f)
+
+    return AutoConfig.from_pretrained(
+        unique_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+    )
+
+
 def _is_deepseek_ocr_model(config: PretrainedConfig) -> bool:
     # TODO: Remove this workaround related when AutoConfig correctly identifies deepseek-ocr.
     # Hugging Face's AutoConfig currently misidentifies it as deepseekvl2.
@@ -221,11 +255,18 @@ def get_config(
         )
 
     except ValueError as e:
-        if not "deepseek_v32" in str(e):
+        if "deepseek_v32" in str(e):
+            config = _load_deepseek_v32_model(
+                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            )
+        elif "glm4_moe_lite" in str(e):
+            # GLM-4.7-Flash uses glm4_moe_lite model_type not recognized by transformers
+            # Load as glm4_moe and let SGLang use architectures field for model selection
+            config = _load_glm4_moe_lite_config(
+                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            )
+        else:
             raise e
-        config = _load_deepseek_v32_model(
-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-        )
 
     if (
         config.architectures is not None
