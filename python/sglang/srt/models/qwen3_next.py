@@ -1,6 +1,6 @@
 import enum
 import logging
-from typing import Any, Iterable, Optional, Set, Tuple
+from typing import Any, Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
@@ -818,6 +818,8 @@ class Qwen3NextModel(nn.Module):
 
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.infer_count = 0
+        # For EAGLE3 support
+        self.layers_to_capture = []
 
     def forward(
         self,
@@ -836,8 +838,13 @@ class Qwen3NextModel(nn.Module):
         else:
             hidden_states = self.embed_tokens(input_ids)
 
+        aux_hidden_states = []
         residual = None
         for i in range(len(self.layers)):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
             layer = self.layers[i]
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual = layer(
@@ -854,7 +861,9 @@ class Qwen3NextModel(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class HybridLayerType(enum.Enum):
@@ -890,6 +899,8 @@ class Qwen3NextForCausalLM(nn.Module):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
@@ -914,9 +925,30 @@ class Qwen3NextForCausalLM(nn.Module):
     ):
         hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        # Only attention layers (every 4th layer: 3, 7, 11, ..., 47) are suitable.
+        # GDN layers produce recurrent hidden states — not compatible with EAGLE3.
+        if not self.pp_group.is_last_rank:
+            return
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            interval = getattr(self.config, "full_attention_interval", 4)
+            attn_layers = [i for i in range(num_layers) if (i + 1) % interval == 0]
+            self.model.layers_to_capture = [
+                attn_layers[0],
+                attn_layers[len(attn_layers) // 2],
+                attn_layers[-1],
+            ]
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
