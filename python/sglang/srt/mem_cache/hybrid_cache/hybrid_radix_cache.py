@@ -88,7 +88,7 @@ class HybridTreeNode:
     def set_component_value(self, name: str, value: Optional[torch.Tensor]) -> None:
         self.component(name).value = value
 
-    def __lt__(self, other: "HybridTreeNode"):
+    def __lt__(self, other: HybridTreeNode):
         return self.last_access_time < other.last_access_time
 
 
@@ -192,7 +192,7 @@ logger = logging.getLogger(__name__)
 class HybridRadixCache(BasePrefixCache):
     def __init__(
         self,
-        params: "CacheInitParams",
+        params: CacheInitParams,
         component_names: tuple[str, ...],
     ):
         self.req_to_token_pool = params.req_to_token_pool
@@ -228,7 +228,7 @@ class HybridRadixCache(BasePrefixCache):
         else:
             self.key_convert_fn = lambda key: key
         self.reset()
-        logger.info(f"Init Hybrid RadixTree with componenets {self.component_names}")
+        logger.info(f"Init Hybrid RadixTree with components {self.component_names}")
 
     def reset(self) -> None:
         self.root_node = HybridTreeNode(self.component_names)
@@ -694,7 +694,7 @@ class HybridRadixCache(BasePrefixCache):
 
 
 class HybridMambaRadixCache(HybridRadixCache):
-    def __init__(self, params: "CacheInitParams"):
+    def __init__(self, params: CacheInitParams):
         assert isinstance(
             params.token_to_kv_pool_allocator, TokenToKVPoolAllocator
         ) or isinstance(params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
@@ -859,7 +859,7 @@ class HybridMambaRadixCache(HybridRadixCache):
 
 # TODO: Support SWA Radix Tree
 class HybridSWARadixCache(HybridRadixCache):
-    def __init__(self, params: "CacheInitParams"):
+    def __init__(self, params: CacheInitParams):
         raise NotImplementedError
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
@@ -870,7 +870,7 @@ class HybridSWARadixCache(HybridRadixCache):
 
 
 def create_hybrid_radix_cache(
-    params: "CacheInitParams",
+    params: CacheInitParams,
     component_names: Optional[tuple[str, ...]] = None,
 ) -> HybridRadixCache:
     if component_names is None:

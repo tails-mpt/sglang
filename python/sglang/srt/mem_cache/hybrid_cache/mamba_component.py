@@ -28,7 +28,7 @@ class MambaComponent(TreeComponent):
     def name(self) -> str:
         return "mamba"
 
-    def create_match_validator(self) -> Callable[["HybridTreeNode"], bool]:
+    def create_match_validator(self) -> Callable[[HybridTreeNode], bool]:
         name = self.name
         return lambda node: node.component_value(name) is not None
 
@@ -77,7 +77,7 @@ class MambaComponent(TreeComponent):
 
     def update_component_on_insert_overlap(
         self,
-        node: "HybridTreeNode",
+        node: HybridTreeNode,
         prefix_len: int,
         total_prefix_len: int,
         value_slice: torch.Tensor,
@@ -89,7 +89,7 @@ class MambaComponent(TreeComponent):
 
     def commit_insert_component_data(
         self,
-        node: "HybridTreeNode",
+        node: HybridTreeNode,
         is_new_leaf: bool,
         params: InsertParams,
         result: InsertResult,
@@ -111,12 +111,12 @@ class MambaComponent(TreeComponent):
         result.mamba_exist = True
 
     def redistribute_on_node_split(
-        self, new_parent: "HybridTreeNode", child: "HybridTreeNode"
+        self, new_parent: HybridTreeNode, child: HybridTreeNode
     ):
         new_parent.set_component_value(self.name, None)
         new_parent.component(self.name).lock_ref = 0
 
-    def evict_component(self, node: "HybridTreeNode", is_leaf: bool) -> int:
+    def evict_component(self, node: HybridTreeNode, is_leaf: bool) -> int:
         value = node.component_value(self.name)
         self.cache.req_to_token_pool.mamba_pool.free(value)
         freed = len(value)
@@ -148,7 +148,7 @@ class MambaComponent(TreeComponent):
                 x = lru.get_lru_no_lock()
 
     def acquire_component_lock(
-        self, node: "HybridTreeNode", result: IncLockRefResult
+        self, node: HybridTreeNode, result: IncLockRefResult
     ) -> IncLockRefResult:
         value = node.component_value(self.name)
         if value is not None:
@@ -159,7 +159,7 @@ class MambaComponent(TreeComponent):
         return result
 
     def release_component_lock(
-        self, node: "HybridTreeNode", params: Optional[DecLockRefParams]
+        self, node: HybridTreeNode, params: Optional[DecLockRefParams]
     ) -> None:
         value = node.component_value(self.name)
         if value is not None:

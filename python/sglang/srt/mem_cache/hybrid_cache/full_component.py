@@ -21,15 +21,15 @@ class FullComponent(TreeComponent):
     def name(self) -> str:
         return BASE_COMPONENT_NAME
 
-    def create_match_validator(self) -> Callable[["HybridTreeNode"], bool]:
+    def create_match_validator(self) -> Callable[[HybridTreeNode], bool]:
         return lambda node: True
 
     def redistribute_on_node_split(
-        self, new_parent: "HybridTreeNode", child: "HybridTreeNode"
+        self, new_parent: HybridTreeNode, child: HybridTreeNode
     ):
         new_parent.component(self.name).lock_ref = child.component(self.name).lock_ref
 
-    def evict_component(self, node: "HybridTreeNode", is_leaf: bool) -> int:
+    def evict_component(self, node: HybridTreeNode, is_leaf: bool) -> int:
         self.cache.token_to_kv_pool_allocator.free(node.full_value)
         freed = len(node.full_value)
         self.cache.component_evictable_size_[self.name] -= freed
@@ -51,7 +51,7 @@ class FullComponent(TreeComponent):
             self.cache._cascade_evict(x, self, tracker)
 
     def acquire_component_lock(
-        self, node: "HybridTreeNode", result: IncLockRefResult
+        self, node: HybridTreeNode, result: IncLockRefResult
     ) -> IncLockRefResult:
         cur = node
         while cur != self.cache.root_node:
@@ -63,7 +63,7 @@ class FullComponent(TreeComponent):
         return result
 
     def release_component_lock(
-        self, node: "HybridTreeNode", params: Optional[DecLockRefParams]
+        self, node: HybridTreeNode, params: Optional[DecLockRefParams]
     ) -> None:
         cur = node
         while cur != self.cache.root_node:
