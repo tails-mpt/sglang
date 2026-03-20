@@ -57,6 +57,11 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.multimodal_gen.runtime.utils.request_abort import (
+    RequestAborted,
+    clear_abort,
+    init_request_abort_state,
+)
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -293,6 +298,14 @@ class GPUWorker:
                 if not req.is_warmup:
                     PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
         except Exception as e:
+            if isinstance(e, RequestAborted):
+                logger.info("Request %s %s", req.request_id, e.reason)
+                if output_batch is None:
+                    output_batch = OutputBatch()
+                output_batch.aborted = True
+                output_batch.abort_reason = e.reason
+                output_batch.metrics = req.metrics
+                return output_batch
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True
             )
@@ -301,6 +314,8 @@ class GPUWorker:
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
+        finally:
+            clear_abort(getattr(req, "request_id", None))
         return output_batch
 
     def get_can_stay_resident_components(
@@ -469,6 +484,7 @@ def run_scheduler_process(
     rank: int,
     master_port: int,
     server_args: ServerArgs,
+    abort_requests,
     pipe_writer: mp.connection.Connection,
     # For all workers: pipe to receive tasks from rank 0
     task_pipe_r: mp.connection.Connection,
@@ -492,6 +508,7 @@ def run_scheduler_process(
         set_musa_arch()
 
     port_args = PortArgs.from_server_args(server_args)
+    init_request_abort_state(abort_requests)
 
     # start the scheduler event loop
     assert task_pipes_to_slaves is not None

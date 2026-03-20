@@ -44,6 +44,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.request_abort import request_abort
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
@@ -130,9 +131,25 @@ async def _dispatch_job_async(
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
+        job = await VIDEO_STORE.get(job_id)
+        if job is not None and job.get("status") != "aborting":
+            await VIDEO_STORE.update_fields(job_id, {"status": "running"})
         save_file_path_list, result = await process_generation_batch(
             async_scheduler_client, batch
         )
+        if result.aborted:
+            update_fields = {
+                "status": "aborted",
+                "completed_at": int(time.time()),
+                "error": {
+                    "message": result.abort_reason or "Generation aborted",
+                },
+            }
+            update_fields = add_common_data_to_response(
+                update_fields, request_id=job_id, result=result
+            )
+            await VIDEO_STORE.update_fields(job_id, update_fields)
+            return
         save_file_path = save_file_path_list[0]
 
         cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
@@ -388,15 +405,28 @@ async def retrieve_video(video_id: str = Path(...)):
         raise HTTPException(status_code=404, detail="Video not found")
     return VideoResponse(**job)
 
-
-# TODO: support aborting a job.
 @router.delete("/{video_id}", response_model=VideoResponse)
 async def delete_video(video_id: str = Path(...)):
-    job = await VIDEO_STORE.pop(video_id)
+    job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
-    # Mark as deleted in response semantics
-    job["status"] = "deleted"
+    if job.get("status") in {"completed", "failed", "aborted", "deleted"}:
+        job = await VIDEO_STORE.pop(video_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Video not found")
+        job["status"] = "deleted"
+        return VideoResponse(**job)
+
+    if not request_abort(video_id):
+        raise HTTPException(status_code=503, detail="Abort control is not initialized")
+    job = await VIDEO_STORE.update_fields(
+        video_id,
+        {
+            "status": "aborting",
+            "error": {"message": "Abort requested"},
+        },
+    )
+    assert job is not None
     return VideoResponse(**job)
 
 

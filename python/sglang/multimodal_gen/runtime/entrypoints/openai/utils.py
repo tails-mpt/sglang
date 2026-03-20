@@ -263,13 +263,14 @@ async def process_generation_batch(
     with log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
 
-        if result.output is None and result.output_file_paths is None:
+        if result.aborted:
+            save_file_path_list = []
+        elif result.output is None and result.output_file_paths is None:
             error_msg = result.error or "Unknown error"
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
-
-        if result.output_file_paths:
+        elif result.output_file_paths:
             save_file_path_list = result.output_file_paths
         else:
             num_outputs = len(result.output)

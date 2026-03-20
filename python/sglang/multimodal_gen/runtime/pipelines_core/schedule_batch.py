@@ -333,6 +333,8 @@ class OutputBatch:
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
     output_file_paths: list[str] | None = None
+    aborted: bool = False
+    abort_reason: str | None = None
 
     # logged metrics info, directly from Req.timings
     metrics: Optional["RequestMetrics"] = None

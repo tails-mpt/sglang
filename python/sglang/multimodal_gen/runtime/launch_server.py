@@ -16,7 +16,12 @@ from sglang.multimodal_gen.runtime.server_args import (
     prepare_server_args,
     set_global_server_args,
 )
+from sglang.multimodal_gen.runtime.utils.request_abort import (
+    init_request_abort_state,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
+
+_abort_manager = None
 
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
@@ -70,6 +75,11 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
 
     num_gpus = server_args.num_gpus
     processes = []
+    global _abort_manager
+    manager = mp.Manager()
+    _abort_manager = manager
+    abort_requests = manager.dict()
+    init_request_abort_state(abort_requests)
 
     # Pipes for master to talk to slaves
     task_pipes_to_slaves_w = []
@@ -103,6 +113,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                     i,  # rank
                     master_port,
                     server_args,
+                    abort_requests,
                     writer,
                     None,  # No task pipe to read from master
                     None,  # No result pipe to write to master
@@ -120,6 +131,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                     i,  # rank
                     master_port,
                     server_args,
+                    abort_requests,
                     writer,
                     None,  # No task pipe to read from master
                     None,  # No result pipe to write to master
