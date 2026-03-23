@@ -53,6 +53,19 @@ __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int
   return accumulator;
 }
 
+// Shared memory size calculation for dynamic allocation.
+// Layout: int32_t region (4-byte aligned) followed by int16_t region (2-byte aligned).
+template <int NUM_TOP_K, int HOT_BUFFER_SIZE>
+struct SmemLayout {
+  static constexpr int HASH_SIZE = NUM_TOP_K * 2;
+  static constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
+  // int32_t region: top_k_tokens + chunk_offset + evict_chunk_offset + hash_keys + total_hits + newest_hit
+  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 2;
+  // int16_t region: lru_slots_out + hash_vals
+  static constexpr int TOTAL_INT16 = HOT_BUFFER_SIZE + HASH_SIZE;
+  static constexpr size_t BYTES = TOTAL_INT32 * sizeof(int32_t) + TOTAL_INT16 * sizeof(int16_t);
+};
+
 // Each block processes one request
 // req_pool_indices are int64_t (pool indices can be large), seq_lens are int32_t
 // Layout: [HOT_BUFFER_SIZE slots for LRU] + [page_size slots for newest token]
@@ -118,21 +131,29 @@ __global__ void load_cache_to_device_buffer_kernel(
     return;
   }
 
-  // Top-k token positions; reused as miss-token scratch in the copy phase
-  __shared__ int32_t s_top_k_tokens[NUM_TOP_K];
-  // Prefix-sum offsets for hit counting and miss counting
-  __shared__ int32_t s_chunk_offset[NUM_BUFFER_CHUNKS + 1];
-  // Prefix-sum offsets for evictable counting
-  __shared__ int32_t s_evict_chunk_offset[NUM_BUFFER_CHUNKS + 1];
-  // Compacted slot ordering: [hits fwd→  ...  ←evictables bwd]
-  __shared__ int16_t s_lru_slots_out[HOT_BUFFER_SIZE];
-  // Open-addressing hash table: top-k token_id → top-k index
-  constexpr int HASH_SIZE = NUM_TOP_K * 2;
-  __shared__ int32_t s_hash_keys[HASH_SIZE];
-  __shared__ int16_t s_hash_vals[HASH_SIZE];
+  // Dynamic shared memory layout: int32_t arrays first, then int16_t arrays.
+  extern __shared__ char smem_raw[];
+  using Layout = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>;
+  constexpr int HASH_SIZE = Layout::HASH_SIZE;
 
-  __shared__ int32_t s_total_hits;
-  __shared__ int32_t s_newest_hit;
+  int32_t* smem_i32 = reinterpret_cast<int32_t*>(smem_raw);
+  // Top-k token positions; reused as miss-token scratch in the copy phase
+  int32_t* s_top_k_tokens = smem_i32;
+  // Prefix-sum offsets for hit counting and miss counting
+  int32_t* s_chunk_offset = s_top_k_tokens + NUM_TOP_K;
+  // Prefix-sum offsets for evictable counting
+  int32_t* s_evict_chunk_offset = s_chunk_offset + (NUM_BUFFER_CHUNKS + 1);
+  // Open-addressing hash table: top-k token_id → top-k index (keys)
+  int32_t* s_hash_keys = s_evict_chunk_offset + (NUM_BUFFER_CHUNKS + 1);
+  // Scalar counters
+  int32_t& s_total_hits = s_hash_keys[HASH_SIZE];
+  int32_t& s_newest_hit = s_hash_keys[HASH_SIZE + 1];
+
+  int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
+  // Compacted slot ordering: [hits fwd→  ...  ←evictables bwd]
+  int16_t* s_lru_slots_out = smem_i16;
+  // Open-addressing hash table: top-k token_id → top-k index (values)
+  int16_t* s_hash_vals = s_lru_slots_out + HOT_BUFFER_SIZE;
 
   // Initialize shared memory: counters, hash table, prefix-sum offsets.
   if (tid == 0) {
@@ -363,8 +384,15 @@ void load_cache_to_device_buffer(
   const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
 
-  LaunchKernel(bs, BLOCK_SIZE, device)(
-      load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA>,
+  constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
+  auto kernel_fn = load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA>;
+  // Opt in to dynamic shared memory beyond the default 48 KB limit.
+  if constexpr (smem_bytes > 48u * 1024u) {
+    cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+  }
+
+  LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
+      kernel_fn,
       static_cast<const int32_t*>(top_k_tokens.data_ptr()),
       static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
       static_cast<const int64_t*>(host_cache_locs.data_ptr()),
