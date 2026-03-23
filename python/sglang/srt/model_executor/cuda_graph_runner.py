@@ -290,7 +290,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
             if raw_num_token < max_num_token:
                 if raw_num_token > 0:
                     self.input_ids[raw_num_token:max_num_token].copy_(
-                        forward_batch.input_ids[:1].expand(max_num_token - raw_num_token)
+                        forward_batch.input_ids[:1].expand(
+                            max_num_token - raw_num_token
+                        )
                     )
                     self.positions[raw_num_token:max_num_token].copy_(
                         forward_batch.positions[:1].expand(
