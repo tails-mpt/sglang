@@ -70,7 +70,7 @@ struct Fp4GemmSm120 {
       cutlass::epilogue::collective::EpilogueTileAuto,
       ElementAccumulator,
       ElementAccumulator,
-      ElementC,
+      void,
       LayoutCTag,
       AlignmentC,
       ElementD,
@@ -143,7 +143,7 @@ typename Gemm::Arguments args_from_options_sm120(
        layout_SFA,
        static_cast<ElementSFB const*>(B_sf.data_ptr()),
        layout_SFB},
-      {{}, static_cast<ElementD const*>(D.data_ptr()), stride_D, static_cast<ElementD*>(D.data_ptr()), stride_D}};
+      {{}, nullptr, stride_D, static_cast<ElementD*>(D.data_ptr()), stride_D}};
   auto& fusion_args = arguments.epilogue.thread;
   fusion_args.alpha_ptr = static_cast<ElementCompute const*>(alpha.data_ptr());
 
