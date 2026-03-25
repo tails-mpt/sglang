@@ -235,8 +235,7 @@ void runGemm(
   auto arguments = args_from_options<T>(D, A, B, A_sf, B_sf, alpha, m, n, k);
 
   size_t workspace_size = T::Gemm::get_workspace_size(arguments);
-  int device_id = A.device().device_id;
-  void* workspace = get_cached_workspace(workspace_size, device_id, stream);
+  void* workspace = get_workspace(workspace_size, A.device());
 
   CUTLASS_CHECK(gemm.can_implement(arguments));
 

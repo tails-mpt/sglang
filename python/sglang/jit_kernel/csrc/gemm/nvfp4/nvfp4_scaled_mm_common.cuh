@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <sgl_kernel/ffi.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -24,7 +25,6 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
-#include <unordered_map>
 
 using namespace host;
 
@@ -50,47 +50,25 @@ inline uint32_t next_pow_2(uint32_t x) noexcept {
   return 1u << (32 - __builtin_clz(x - 1));
 }
 
-struct WorkspaceKey {
-  int device_id;
-  uintptr_t stream;
-  auto operator==(const WorkspaceKey&) const -> bool = default;
-};
-
-struct WorkspaceKeyHash {
-  auto operator()(const WorkspaceKey& key) const -> size_t {
-    size_t h1 = std::hash<int>{}(key.device_id);
-    size_t h2 = std::hash<uintptr_t>{}(key.stream);
-    return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
-  }
-};
-
-struct WorkspaceState {
-  void* ptr = nullptr;
-  size_t bytes = 0;
-};
-
-inline auto get_cached_workspace(size_t required_bytes, int device_id, cudaStream_t stream) -> void* {
+inline auto get_workspace(size_t required_bytes, DLDevice device) -> void* {
   if (required_bytes == 0) {
     return nullptr;
   }
+  thread_local tvm::ffi::Tensor cached;
+  thread_local size_t cached_bytes = 0;
+  thread_local DLDevice cached_device = {kDLCPU, -1};
 
-  thread_local std::unordered_map<WorkspaceKey, WorkspaceState, WorkspaceKeyHash> cache;
-  WorkspaceKey key{device_id, reinterpret_cast<uintptr_t>(stream)};
-  auto& ws = cache[key];
-
-  if (ws.ptr != nullptr && ws.bytes >= required_bytes) {
-    return ws.ptr;
+  if (cached_bytes >= required_bytes && cached_device.device_type == device.device_type &&
+      cached_device.device_id == device.device_id) {
+    return cached.data_ptr();
   }
 
-  RuntimeDeviceCheck(cudaSetDevice(device_id));
-  if (ws.ptr != nullptr) {
-    RuntimeDeviceCheck(cudaFreeAsync(ws.ptr, stream));
-    ws.ptr = nullptr;
-    ws.bytes = 0;
-  }
-  RuntimeDeviceCheck(cudaMallocAsync(&ws.ptr, required_bytes, stream));
-  ws.bytes = required_bytes;
-  return ws.ptr;
+  DLDataType u8 = {kDLUInt, 8, 1};
+  int64_t shape[] = {static_cast<int64_t>(required_bytes)};
+  cached = ffi::empty(tvm::ffi::ShapeView(shape, 1), u8, device);
+  cached_bytes = required_bytes;
+  cached_device = device;
+  return cached.data_ptr();
 }
 
 inline int getSMVersion(int device_id) {
