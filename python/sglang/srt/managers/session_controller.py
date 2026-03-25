@@ -25,6 +25,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
+from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -262,7 +263,9 @@ class SessionController:
                 streaming=bool(recv_req.streaming),
                 timeout=recv_req.timeout,
             )
-            logger.info("Session opened: %s (active=%d)", session_id, len(self.sessions))
+            log_info_on_rank0(
+                logger, f"Session opened: {session_id} (active={len(self.sessions)})"
+            )
             return OpenSessionReqOutput(session_id, True)
 
     def close(self, recv_req: CloseSessionReqInput):
@@ -282,7 +285,9 @@ class SessionController:
         if isinstance(self.tree_cache, SessionAwareCache):
             self.tree_cache.release_session(session_id)
         del self.sessions[session_id]
-        logger.info("Session closed: %s (active=%d)", session_id, len(self.sessions))
+        log_info_on_rank0(
+            logger, f"Session closed: {session_id} (active={len(self.sessions)})"
+        )
 
     def maybe_reap(self, now: float, interval: float = 1.0):
         # reap sessions every second
@@ -292,7 +297,7 @@ class SessionController:
                 sid for sid, session in self.sessions.items() if session.is_timed_out()
             ]
             for sid in timed_out:
-                logger.info(f"Session {sid} timed out, closing.")
+                log_info_on_rank0(logger, f"Session {sid} timed out, closing.")
                 self._close(sid)
 
     @staticmethod
