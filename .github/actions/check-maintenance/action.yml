@@ -29,7 +29,8 @@ runs:
         ISSUE_STATE=$(gh issue view "$MAINTENANCE_ISSUE" --repo "$REPO" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
 
         # Debug: print rate limit after API call
-        gh api rate_limit --jq '"[check-maintenance] core: \(.resources.core.used)/\(.resources.core.limit) used, \(.resources.core.remaining) remaining, reset=\(.resources.core.reset)"' 2>/dev/null || true
+        RL_JSON=$(gh api rate_limit --jq '.resources.core' 2>/dev/null || echo '{}')
+        echo "[check-maintenance] core rate limit: $RL_JSON"
 
         if [[ "$ISSUE_STATE" != "OPEN" ]]; then
           echo "✅ Maintenance mode is OFF. Proceeding with CI."
