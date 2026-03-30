@@ -65,6 +65,7 @@ class TestLoRATP(CustomTestCase):
                         max_new_tokens=32,
                         enable_lora_overlap_loading=enable_lora_overlap_loading,
                         test_tag=f"tp={tp_size}, enable_lora_overlap_loading={enable_lora_overlap_loading}",
+                        attention_backend="fa3",
                     )
 
     def test_ci_lora_models(self):
