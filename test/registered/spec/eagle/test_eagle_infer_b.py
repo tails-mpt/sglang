@@ -18,7 +18,7 @@ from sglang.test.kits.abort_timeout_kit import (
     WaitingTimeoutMixin,
 )
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
-from sglang.test.run_eval import run_eval as run_gsm8k_eval
+from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
 from sglang.test.test_utils import DEFAULT_TARGET_MODEL_EAGLE, run_logprob_check
 
@@ -59,7 +59,7 @@ class TestEAGLEServerBasic(EagleServerBase):
         )
 
         # Just run and check it does not hang
-        metrics = run_gsm8k_eval(args)
+        metrics = run_eval(args)
         self.assertGreater(metrics["output_throughput"], 50)
 
         # Wait a little bit so that the memory check happens.
@@ -76,7 +76,7 @@ class TestEAGLEServerBasic(EagleServerBase):
             num_threads=128,
         )
 
-        metrics = run_gsm8k_eval(args)
+        metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.20)
 
