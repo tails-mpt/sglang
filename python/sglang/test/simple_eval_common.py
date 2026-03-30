@@ -109,7 +109,6 @@ class ChatCompletionSampler(SamplerBase):
         self.reasoning_effort = reasoning_effort
         self.extra_body = extra_body
         self.image_format = "url"
-        # Thread-safe: list.append is atomic in CPython (GIL); reads happen after join.
         self._completion_tokens: list[int] = []
         print(
             f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=} {self.extra_body=}"
