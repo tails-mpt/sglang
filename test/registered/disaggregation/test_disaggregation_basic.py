@@ -13,7 +13,9 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
+    DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_TARGET_MODEL_EAGLE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
 )
@@ -246,6 +248,105 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             "--base-gpu-id",
             "1",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_decode = popen_launch_pd_server(
+            cls.model,
+            cls.decode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=decode_args,
+        )
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            num_examples=200,
+            num_threads=128,
+        )
+
+        # Expect lots of failure but the server cannot crash
+        try:
+            metrics = run_eval_few_shot_gsm8k(args)
+            print(f"Evaluation metrics: {metrics}")
+        except Exception as e:
+            print(f"Test encountered expected errors: {e}")
+            # Check if servers are still healthy
+            try:
+                response = requests.get(self.prefill_url + "/health_generate")
+                assert response.status_code == 200
+                response = requests.get(self.decode_url + "/health_generate")
+                assert response.status_code == 200
+            except Exception as health_check_error:
+                # If health check fails, re-raise the original exception
+                raise e from health_check_error
+
+
+class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = DEFAULT_TARGET_MODEL_EAGLE
+        cls.draft_model = DEFAULT_DRAFT_MODEL_EAGLE
+        cls.spec_args = [
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-draft-model-path",
+            cls.draft_model,
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "4",
+            "--speculative-num-draft-tokens",
+            "16",
+            "--cuda-graph-max-bs",
+            "8",
+        ]
+        print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
+
+        # Non blocking start servers
+        cls.start_prefill()
+        cls.start_decode()
+
+        # Block until both
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+
+        cls.launch_lb()
+
+    @classmethod
+    def start_prefill(cls):
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "1",
+        ] + cls.spec_args
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+        )
+
+    @classmethod
+    def start_decode(cls):
+        decode_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "1",
+            "--base-gpu-id",
+            "1",
+        ] + cls.spec_args
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
