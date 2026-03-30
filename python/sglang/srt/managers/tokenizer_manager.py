@@ -83,7 +83,6 @@ from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
-    calibrate_time_diff,
     convert_time_to_realtime,
     real_time,
     set_time_batch,
@@ -1101,47 +1100,29 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.send_to_scheduler.send_pyobj(batch_req)
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
 
-    def _drain_pending_outputs(
+    def _coalesce_streaming_chunks(
         self,
-        state: ReqState,
-        is_stream: bool,
+        out_list: list,
         rid: str,
-    ):
-        """Drain all pending outputs atomically.
+    ) -> dict:
+        """Coalesce multiple incremental streaming chunks into one.
 
-        With incremental streaming output, each chunk carries only a delta, so
-        every queued chunk must be yielded to avoid dropping token ids. Without
-        it, outputs are cumulative and only the latest chunk contains the full
-        result, so we can safely skip intermediate ones.
+        Both text and output_ids are incremental deltas, so we concatenate them;
+        all other fields (meta_info, etc.) are taken from the last chunk.
         """
-        incremental_stream = is_stream and self.server_args.incremental_streaming_output
-        out_list = state.out_list
-        state.out_list = []
-        finished = state.finished
-        state.event.clear()
-
-        if incremental_stream and len(out_list) > 1:
-            if len(out_list) >= 20:
-                logger.warning(
-                    "Streaming backlog: rid=%s, coalescing %d queued chunks into one. "
-                    "This may inflate P99 ITL for affected requests.",
-                    rid,
-                    len(out_list),
-                )
-            # Coalesce all deltas into a single chunk. Both text and
-            # output_ids are incremental, so we concatenate them; all
-            # other fields (meta_info, etc.) are taken from the last chunk.
-            out = dict(out_list[-1])
-            if "output_ids" in out:
-                out["output_ids"] = [
-                    id for chunk in out_list for id in chunk["output_ids"]
-                ]
-            if "text" in out:
-                out["text"] = "".join(chunk["text"] for chunk in out_list)
-        else:
-            out = out_list[-1]
-
-        return out, finished
+        if len(out_list) >= 20:
+            logger.warning(
+                "Streaming backlog: rid=%s, coalescing %d queued chunks into one. "
+                "This may inflate P99 ITL for affected requests.",
+                rid,
+                len(out_list),
+            )
+        out = dict(out_list[-1])
+        if "output_ids" in out:
+            out["output_ids"] = [id for chunk in out_list for id in chunk["output_ids"]]
+        if "text" in out:
+            out["text"] = "".join(chunk["text"] for chunk in out_list)
+        return out
 
     async def _handle_abort_finish_reason(
         self,
@@ -1209,12 +1190,27 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
                     self.abort_request(obj.rid)
+                    # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
                     )
                 continue
 
-            out, finished = self._drain_pending_outputs(state, is_stream, obj.rid)
+            # Drain all pending outputs atomically.
+            out_list = state.out_list
+            state.out_list = []
+            finished = state.finished
+            state.event.clear()
+
+            # With incremental streaming, each chunk is a delta — coalesce
+            # multiple queued chunks to avoid dropping token ids.
+            incremental_stream = (
+                is_stream and self.server_args.incremental_streaming_output
+            )
+            if incremental_stream and len(out_list) > 1:
+                out = self._coalesce_streaming_chunks(out_list, obj.rid)
+            else:
+                out = out_list[-1]
 
             if finished:
                 # Record response sent time right before we log finished results and metrics.
@@ -1262,6 +1258,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 ):
                     # Abort the request for disconnected requests (non-streaming, running)
                     self.abort_request(obj.rid)
+                    # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
                     )
@@ -1322,7 +1319,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
-                tokenized_obj.time_stats = self.rid_to_state[tmp_obj.rid].time_stats
                 self._send_one_request(tokenized_obj)
                 await self._wait_one_response(tmp_obj, request).__anext__()
 
@@ -2302,7 +2298,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
-        calibrate_time_diff()
         created_time = obj.received_time
 
         external_trace_header = None

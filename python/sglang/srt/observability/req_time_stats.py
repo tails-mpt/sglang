@@ -106,7 +106,7 @@ class RequestStage:
     )
 
     # DP controller
-    DC_DISPATCH = RequestStageConfig(
+    DPC_DISPATCH = RequestStageConfig(
         "dpc_dispatch",
         level=2,
     )
@@ -487,8 +487,8 @@ class DPControllerReqTimeStats(ReqTimeStatsBase):
 
         if self.trace_ctx.tracing_enable:
             self.trace_ctx.trace_slice_start(
-                RequestStage.DC_DISPATCH.stage_name,
-                RequestStage.DC_DISPATCH.level,
+                RequestStage.DPC_DISPATCH.stage_name,
+                RequestStage.DPC_DISPATCH.level,
                 convert_time_to_realtime_ns(ts),
             )
 
@@ -498,8 +498,8 @@ class DPControllerReqTimeStats(ReqTimeStatsBase):
 
         if self.trace_ctx.tracing_enable:
             self.trace_ctx.trace_slice_end(
-                RequestStage.DC_DISPATCH.stage_name,
-                RequestStage.DC_DISPATCH.level,
+                RequestStage.DPC_DISPATCH.stage_name,
+                RequestStage.DPC_DISPATCH.level,
                 convert_time_to_realtime_ns(ts),
                 thread_finish_flag=True,
             )
