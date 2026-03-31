@@ -747,7 +747,7 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
-            elif self.server_args.enable_unified_radix_tree:
+            elif envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
                 from sglang.srt.mem_cache.unified_cache_components import (
                     ComponentType,
                 )

@@ -179,10 +179,10 @@ class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "2",
                 "--mem-fraction-static",
                 "0.80",
-                "--enable-unified-radix-tree",
                 "--page-size",
                 "64",
             ],
+            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
@@ -219,8 +219,8 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "extra_buffer",
                 "--mamba-track-interval",
                 str(MAMBA_TRACK_INTERVAL),
-                "--enable-unified-radix-tree",
             ],
+            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
@@ -247,8 +247,8 @@ class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "2",
                 "--mem-fraction-static",
                 "0.80",
-                "--enable-unified-radix-tree",
             ],
+            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 

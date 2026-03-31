@@ -460,6 +460,9 @@ class Envs:
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
 
+    # Unified Radix Tree
+    SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
+
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
 
