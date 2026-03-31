@@ -51,7 +51,7 @@ class TestEAGLEServerBasic(EagleServerBase):
 
         args = SimpleNamespace(
             base_url=self.base_url,
-            model=self.model,
+            model=self.target_model,
             eval_name="gsm8k",
             num_examples=200,
             num_threads=128,
@@ -70,7 +70,7 @@ class TestEAGLEServerBasic(EagleServerBase):
 
         args = SimpleNamespace(
             base_url=self.base_url,
-            model=self.model,
+            model=self.target_model,
             eval_name="gsm8k",
             num_examples=200,
             num_threads=128,
