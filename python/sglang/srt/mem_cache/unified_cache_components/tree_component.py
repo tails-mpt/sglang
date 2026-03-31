@@ -26,25 +26,25 @@ if TYPE_CHECKING:
     )
 
 
-class ComponentName(str, Enum):
+class ComponentType(str, Enum):
     FULL = "full"
     SWA = "swa"
     MAMBA = "mamba"
 
     @property
     def is_full(self) -> bool:
-        return self == ComponentName.FULL
+        return self == ComponentType.FULL
 
     @property
     def is_swa(self) -> bool:
-        return self == ComponentName.SWA
+        return self == ComponentType.SWA
 
     @property
     def is_mamba(self) -> bool:
-        return self == ComponentName.MAMBA
+        return self == ComponentType.MAMBA
 
 
-BASE_COMPONENT_NAME = ComponentName.FULL
+BASE_COMPONENT_TYPE = ComponentType.FULL
 
 _LAST_ACCESS_TIME_COUNTER_FLOAT = float64(1.0)
 _COMPONENT_UUID_COUNTER = 1
@@ -75,16 +75,16 @@ class TreeComponent(ABC):
         self.cache = cache
 
     def node_has_component_data(self, node: UnifiedTreeNode) -> bool:
-        return node.component_value(self.name) is not None
+        return node.component_value(self.component_type) is not None
 
     def value_len(self, node: UnifiedTreeNode) -> int:
-        value = node.component_value(self.name)
+        value = node.component_value(self.component_type)
         return len(value) if value is not None else 0
 
     @property
     @abstractmethod
-    def name(self) -> ComponentName:
-        """Component identifier — one of the ``ComponentName`` enum values."""
+    def component_type(self) -> ComponentType:
+        """Component identifier — one of the ``ComponentType`` enum values."""
         ...
 
     @abstractmethod

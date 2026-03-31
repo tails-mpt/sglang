@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentName
+from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
 )
@@ -126,7 +126,7 @@ class TestUnifiedRadixCacheMamba(unittest.TestCase):
                 token_to_kv_pool_allocator=allocator,
                 page_size=_PAGE_SIZE,
                 disable=False,
-                tree_components=(ComponentName.FULL, ComponentName.MAMBA),
+                tree_components=(ComponentType.FULL, ComponentType.MAMBA),
             ),
         )
 
@@ -483,9 +483,9 @@ class TestUnifiedRadixCacheSWAMamba(unittest.TestCase):
                 disable=False,
                 sliding_window_size=sliding_window_size,
                 tree_components=(
-                    ComponentName.FULL,
-                    ComponentName.SWA,
-                    ComponentName.MAMBA,
+                    ComponentType.FULL,
+                    ComponentType.SWA,
+                    ComponentType.MAMBA,
                 ),
             ),
         )
@@ -760,7 +760,7 @@ class TestUnifiedRadixCacheSWAMamba(unittest.TestCase):
         self.assertIsNotNone(req2.mamba_pool_idx)
 
         # Verify the copy matches
-        src_value = m.last_device_node.component_value(ComponentName.MAMBA)
+        src_value = m.last_device_node.component_value(ComponentType.MAMBA)
         self.assertTrue(
             torch.all(
                 mamba_pool.mamba_cache.conv[0][:, req2.mamba_pool_idx]
@@ -821,7 +821,7 @@ class TestUnifiedRadixCacheHelpers(unittest.TestCase):
                 page_size=_PAGE_SIZE,
                 disable=False,
                 tree_components=(
-                    ComponentName.FULL,
+                    ComponentType.FULL,
                 ),  # Full attention only, no mamba/swa
             ),
         )

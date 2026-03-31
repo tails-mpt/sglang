@@ -749,16 +749,16 @@ class Scheduler(
                 )
             elif self.server_args.enable_unified_radix_tree:
                 from sglang.srt.mem_cache.unified_cache_components import (
-                    ComponentName,
+                    ComponentType,
                 )
                 from sglang.srt.mem_cache.unified_radix_cache import (
                     UnifiedRadixCache,
                 )
 
-                tree_components = [ComponentName.FULL]
+                tree_components = [ComponentType.FULL]
                 if self.is_hybrid_swa or self.is_hybrid_ssm:
                     tree_components.append(
-                        ComponentName.SWA if self.is_hybrid_swa else ComponentName.MAMBA
+                        ComponentType.SWA if self.is_hybrid_swa else ComponentType.MAMBA
                     )
                 params.tree_components = tuple(tree_components)
                 self.tree_cache = UnifiedRadixCache(params)

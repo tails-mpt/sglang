@@ -29,9 +29,9 @@ from sglang.srt.mem_cache.radix_cache import (
     page_align_keys,
 )
 from sglang.srt.mem_cache.unified_cache_components import (
-    BASE_COMPONENT_NAME,
+    BASE_COMPONENT_TYPE,
     ComponentData,
-    ComponentName,
+    ComponentType,
     FullComponent,
     MambaComponent,
     SWAComponent,
@@ -53,69 +53,65 @@ class UnifiedTreeNode:
         self.parent: UnifiedTreeNode | None = None
         self.key: Optional[RadixKey] = None
         self.tree_components = list(tree_components)
-        self.component_data = {
-            component_name: ComponentData() for component_name in self.tree_components
-        }
+        self.component_data = {ct: ComponentData() for ct in self.tree_components}
         self.last_access_time = get_last_access_time()
         self.host_value = None
         self.hit_count = 0
         self.lru_prev: dict[str, UnifiedTreeNode | None] = {
-            component_name: None for component_name in self.tree_components
+            ct: None for ct in self.tree_components
         }
         self.lru_next: dict[str, UnifiedTreeNode | None] = {
-            component_name: None for component_name in self.tree_components
+            ct: None for ct in self.tree_components
         }
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
 
-    def component(self, name: str) -> ComponentData:
-        return self.component_data[name]
+    def component(self, component_type: str) -> ComponentData:
+        return self.component_data[component_type]
 
     @property
     def full_value(self) -> Optional[torch.Tensor]:
-        return self.component(BASE_COMPONENT_NAME).value
+        return self.component(BASE_COMPONENT_TYPE).value
 
     @full_value.setter
     def full_value(self, value: Optional[torch.Tensor]) -> None:
-        self.component(BASE_COMPONENT_NAME).value = value
+        self.component(BASE_COMPONENT_TYPE).value = value
 
-    def component_value(self, name: str) -> Optional[torch.Tensor]:
-        return self.component(name).value
+    def component_value(self, component_type: str) -> Optional[torch.Tensor]:
+        return self.component(component_type).value
 
-    def set_component_value(self, name: str, value: Optional[torch.Tensor]) -> None:
-        self.component(name).value = value
+    def set_component_value(
+        self, component_type: str, value: Optional[torch.Tensor]
+    ) -> None:
+        self.component(component_type).value = value
 
     def __lt__(self, other: UnifiedTreeNode):
         return self.last_access_time < other.last_access_time
 
 
 class UnifiedLRUList:
-    def __init__(self, component_name: str, tree_components: list[str]):
-        self.component_name = component_name
+    def __init__(self, component_type: str, tree_components: list[str]):
+        self.component_type = component_type
         self.head = UnifiedTreeNode(tree_components)
         self.tail = UnifiedTreeNode(tree_components)
-        self.head.lru_next[component_name] = self.tail
-        self.tail.lru_prev[component_name] = self.head
+        self.head.lru_next[component_type] = self.tail
+        self.tail.lru_prev[component_type] = self.head
         self.cache: dict[int, UnifiedTreeNode] = {}
 
     def _add_node_after(self, prev_node: UnifiedTreeNode, new_node: UnifiedTreeNode):
-        component_name = self.component_name
-        new_node.lru_prev[component_name] = prev_node
-        new_node.lru_next[component_name] = prev_node.lru_next[component_name]
-        prev_node.lru_next[component_name].lru_prev[component_name] = new_node
-        prev_node.lru_next[component_name] = new_node
+        ct = self.component_type
+        new_node.lru_prev[ct] = prev_node
+        new_node.lru_next[ct] = prev_node.lru_next[ct]
+        prev_node.lru_next[ct].lru_prev[ct] = new_node
+        prev_node.lru_next[ct] = new_node
 
     def _add_node(self, node: UnifiedTreeNode):
         self._add_node_after(self.head, node)
 
     def _remove_node(self, node: UnifiedTreeNode):
-        component_name = self.component_name
-        node.lru_prev[component_name].lru_next[component_name] = node.lru_next[
-            component_name
-        ]
-        node.lru_next[component_name].lru_prev[component_name] = node.lru_prev[
-            component_name
-        ]
+        ct = self.component_type
+        node.lru_prev[ct].lru_next[ct] = node.lru_next[ct]
+        node.lru_next[ct].lru_prev[ct] = node.lru_prev[ct]
 
     def insert_mru(self, node: UnifiedTreeNode):
         assert node.id not in self.cache
@@ -153,9 +149,9 @@ class UnifiedLRUList:
     def get_prev_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         if check_id:
             assert node.id in self.cache
-        x = node.lru_prev[self.component_name]
-        while x.component(self.component_name).lock_ref > 0:
-            x = x.lru_prev[self.component_name]
+        x = node.lru_prev[self.component_type]
+        while x.component(self.component_type).lock_ref > 0:
+            x = x.lru_prev[self.component_type]
         if x == self.head:
             return None
         return x
@@ -163,9 +159,9 @@ class UnifiedLRUList:
     def get_prev_leaf_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         if check_id:
             assert node.id in self.cache
-        x = node.lru_prev[self.component_name]
-        while x.component(self.component_name).lock_ref > 0 or len(x.children) > 0:
-            x = x.lru_prev[self.component_name]
+        x = node.lru_prev[self.component_type]
+        while x.component(self.component_type).lock_ref > 0 or len(x.children) > 0:
+            x = x.lru_prev[self.component_type]
         if x == self.head:
             return None
         return x
@@ -177,10 +173,10 @@ class UnifiedLRUList:
         return self.get_prev_leaf_no_lock(self.tail, check_id=False)
 
 
-COMPONENT_REGISTRY: dict[ComponentName, type[TreeComponent]] = {
-    ComponentName.FULL: FullComponent,
-    ComponentName.MAMBA: MambaComponent,
-    ComponentName.SWA: SWAComponent,
+COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
+    ComponentType.FULL: FullComponent,
+    ComponentType.MAMBA: MambaComponent,
+    ComponentType.SWA: SWAComponent,
 }
 
 logger = logging.getLogger(__name__)
@@ -217,7 +213,7 @@ class UnifiedRadixCache(BasePrefixCache):
         assert params.tree_components is not None
         self.tree_components = list(params.tree_components)
         self.components: dict[str, TreeComponent] = {
-            name: COMPONENT_REGISTRY[name](self) for name in self.tree_components
+            ct: COMPONENT_REGISTRY[ct](self) for ct in self.tree_components
         }
         if self.is_eagle:
             self.key_convert_fn = convert_to_bigram_key
@@ -230,13 +226,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.key = RadixKey([], None)
         self.root_node.full_value = []
-        for component_name in self.tree_components:
-            self.root_node.component(component_name).lock_ref = 1
-        self.component_evictable_size_ = {name: 0 for name in self.tree_components}
-        self.component_protected_size_ = {name: 0 for name in self.tree_components}
+        for ct in self.tree_components:
+            self.root_node.component(ct).lock_ref = 1
+        self.component_evictable_size_ = {ct: 0 for ct in self.tree_components}
+        self.component_protected_size_ = {ct: 0 for ct in self.tree_components}
         self.lru_lists = {
-            component_name: UnifiedLRUList(component_name, self.tree_components)
-            for component_name in self.tree_components
+            ct: UnifiedLRUList(ct, self.tree_components) for ct in self.tree_components
         }
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
@@ -276,16 +271,16 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return EvictResult()
         start_time = time.perf_counter()
-        tracker = {name: 0 for name in self.tree_components}
+        tracker = {ct: 0 for ct in self.tree_components}
 
         for component in self.components.values():
             component.drive_eviction(params, tracker)
 
         self.update_eviction_metrics(sum(tracker.values()), start_time)
         return EvictResult(
-            num_tokens_evicted=tracker[BASE_COMPONENT_NAME],
-            swa_num_tokens_evicted=tracker.get(ComponentName.SWA, 0),
-            mamba_num_evicted=tracker.get(ComponentName.MAMBA, 0),
+            num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
+            swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
+            mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
         )
 
     def inc_lock_ref(self, node: UnifiedTreeNode) -> IncLockRefResult:
@@ -449,9 +444,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     ## Internal Helper Functions
     def _for_each_component_lru(self, node: UnifiedTreeNode, lru_op):
-        for component_name, component in self.components.items():
+        for ct, component in self.components.items():
             if component.node_has_component_data(node):
-                lru_op(self.lru_lists[component_name], node)
+                lru_op(self.lru_lists[ct], node)
 
     def _match_prefix_helper_readonly(
         self, key: RadixKey
@@ -464,13 +459,13 @@ class UnifiedRadixCache(BasePrefixCache):
         best_value_len = 0
         best_node = node
         validators = {
-            name: component.create_match_validator()
-            for name, component in self.components.items()
+            ct: component.create_match_validator()
+            for ct, component in self.components.items()
         }
 
         def _update_best_if_valid(node):
             nonlocal best_value_len, best_node
-            if all(validators[name](node) for name in self.components):
+            if all(validators[ct](node) for ct in self.components):
                 best_value_len = len(value)
                 best_node = node
 
@@ -497,13 +492,13 @@ class UnifiedRadixCache(BasePrefixCache):
         best_value_len = 0
         best_node = node
         validators = {
-            name: component.create_match_validator()
-            for name, component in self.components.items()
+            ct: component.create_match_validator()
+            for ct, component in self.components.items()
         }
 
         def _update_best_if_valid(node):
             nonlocal best_value_len, best_node
-            if all(validators[name](node) for name in self.components):
+            if all(validators[ct](node) for ct in self.components):
                 best_value_len = len(value)
                 best_node = node
 
@@ -531,8 +526,8 @@ class UnifiedRadixCache(BasePrefixCache):
         best_value_len: int,
     ) -> MatchResult:
         node_update = last_node
-        for component_name, component in self.components.items():
-            self.lru_lists[component_name].reset_node_and_parents_mru(
+        for ct, component in self.components.items():
+            self.lru_lists[ct].reset_node_and_parents_mru(
                 node_update, self.root_node, component.node_has_component_data
             )
         cur_time = get_last_access_time()
@@ -597,8 +592,8 @@ class UnifiedRadixCache(BasePrefixCache):
         new_node.key = key
         new_node.full_value = value.clone()
         parent.children[self.get_child_key_fn(key)] = new_node
-        self.lru_lists[BASE_COMPONENT_NAME].insert_mru(new_node)
-        self.component_evictable_size_[BASE_COMPONENT_NAME] += len(value)
+        self.lru_lists[BASE_COMPONENT_TYPE].insert_mru(new_node)
+        self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
         return new_node
 
     def _insert_helper(
@@ -678,8 +673,8 @@ class UnifiedRadixCache(BasePrefixCache):
         tracker: dict[str, int],
     ) -> int:
         freed = comp.evict_component(node, is_leaf=is_leaf)
-        tracker[comp.name] += freed
-        lru = self.lru_lists[comp.name]
+        tracker[comp.component_type] += freed
+        lru = self.lru_lists[comp.component_type]
         if lru.in_list(node):
             lru.remove_node(node)
         return freed
@@ -693,7 +688,7 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self.components.values():
             if comp.eviction_priority(is_leaf) <= trigger_priority:
                 if comp is not trigger and comp.node_has_component_data(node):
-                    assert node.component(comp.name).lock_ref == 0
+                    assert node.component(comp.component_type).lock_ref == 0
                     self._evict_component_and_detach_lru(
                         node, comp, is_leaf=is_leaf, tracker=tracker
                     )
@@ -717,7 +712,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 break
 
             if any(
-                cur.component(comp.name).lock_ref > 0
+                cur.component(comp.component_type).lock_ref > 0
                 for comp in self.components.values()
                 if comp.node_has_component_data(cur)
             ):
@@ -737,16 +732,16 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.req_to_token_pool.mamba_pool
 
     def supports_swa(self) -> bool:
-        return ComponentName.SWA in self.components
+        return ComponentType.SWA in self.components
 
     def supports_mamba(self) -> bool:
-        return ComponentName.MAMBA in self.components
+        return ComponentType.MAMBA in self.components
 
     def evictable_size(self) -> int:
-        return self.component_evictable_size_.get(BASE_COMPONENT_NAME, 0)
+        return self.component_evictable_size_.get(BASE_COMPONENT_TYPE, 0)
 
     def protected_size(self) -> int:
-        return self.component_protected_size_.get(BASE_COMPONENT_NAME, 0)
+        return self.component_protected_size_.get(BASE_COMPONENT_TYPE, 0)
 
     def full_evictable_size(self) -> int:
         return self.evictable_size()
@@ -755,16 +750,16 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.protected_size()
 
     def swa_evictable_size(self) -> int:
-        return self.component_evictable_size_.get(ComponentName.SWA, 0)
+        return self.component_evictable_size_.get(ComponentType.SWA, 0)
 
     def mamba_evictable_size(self) -> int:
-        return self.component_evictable_size_.get(ComponentName.MAMBA, 0)
+        return self.component_evictable_size_.get(ComponentType.MAMBA, 0)
 
     def swa_protected_size(self) -> int:
-        return self.component_protected_size_.get(ComponentName.SWA, 0)
+        return self.component_protected_size_.get(ComponentType.SWA, 0)
 
     def mamba_protected_size(self) -> int:
-        return self.component_protected_size_.get(ComponentName.MAMBA, 0)
+        return self.component_protected_size_.get(ComponentType.MAMBA, 0)
 
     def total_size(self):
         total_size = 0
@@ -773,10 +768,10 @@ class UnifiedRadixCache(BasePrefixCache):
         while stack:
             node = stack.pop()
             total_size += len(node.full_value)
-            for component_name in self.tree_components:
-                if component_name == BASE_COMPONENT_NAME:
+            for ct in self.tree_components:
+                if ct == BASE_COMPONENT_TYPE:
                     continue
-                value = node.component_value(component_name)
+                value = node.component_value(ct)
                 if value is not None:
                     total_aux_size += len(value)
             for child in node.children.values():
@@ -796,14 +791,14 @@ class UnifiedRadixCache(BasePrefixCache):
             return torch.cat(values)
         return torch.tensor([], dtype=torch.int64, device=self.device)
 
-    def _all_component_values_flatten(self, component_name: str) -> torch.Tensor:
-        if component_name not in self.components:
+    def _all_component_values_flatten(self, component_type: str) -> torch.Tensor:
+        if component_type not in self.components:
             return torch.tensor([], dtype=torch.int64, device=self.device)
 
         values = []
 
         def _dfs(node: UnifiedTreeNode):
-            value = node.component_value(component_name)
+            value = node.component_value(component_type)
             if value is not None:
                 values.append(value)
             for child in node.children.values():
@@ -815,53 +810,53 @@ class UnifiedRadixCache(BasePrefixCache):
         return torch.tensor([], dtype=torch.int64, device=self.device)
 
     def all_mamba_values_flatten(self) -> torch.Tensor:
-        return self._all_component_values_flatten(ComponentName.MAMBA)
+        return self._all_component_values_flatten(ComponentType.MAMBA)
 
     def all_swa_values_flatten(self) -> torch.Tensor:
-        return self._all_component_values_flatten(ComponentName.SWA)
+        return self._all_component_values_flatten(ComponentType.SWA)
 
     def available_and_evictable_str(self) -> str:
         if self.supports_swa():
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         else:
             full_available_size = self.token_to_kv_pool_allocator.available_size()
-        full_evictable = self.component_evictable_size_[BASE_COMPONENT_NAME]
+        full_evictable = self.component_evictable_size_[BASE_COMPONENT_TYPE]
         lines = [
             f"Available full tokens: {full_available_size + full_evictable} "
             f"(full_available_size={full_available_size} + full_evictable_size_={full_evictable})"
         ]
-        for component_name in self.tree_components:
-            if component_name == BASE_COMPONENT_NAME:
+        for ct in self.tree_components:
+            if ct == BASE_COMPONENT_TYPE:
                 continue
-            if component_name.is_swa:
+            if ct.is_swa:
                 available_size = self.token_to_kv_pool_allocator.swa_available_size()
-            elif component_name.is_mamba:
+            elif ct.is_mamba:
                 available_size = self.cache_req_mamba_pool.available_size()
 
             lines.append(
-                f"Available {component_name}: {available_size + self.component_evictable_size_[component_name]} "
-                f"(available_size={available_size} + component_evictable_size_={self.component_evictable_size_[component_name]})"
+                f"Available {ct}: {available_size + self.component_evictable_size_[ct]} "
+                f"(available_size={available_size} + component_evictable_size_={self.component_evictable_size_[ct]})"
             )
         return "\n".join(lines) + "\n"
 
     def sanity_check(self):
-        for component_name in self.tree_components:
-            assert self.component_evictable_size_[component_name] >= 0
-            assert self.component_protected_size_[component_name] >= 0
+        for ct in self.tree_components:
+            assert self.component_evictable_size_[ct] >= 0
+            assert self.component_protected_size_[ct] >= 0
 
     def pretty_print(self) -> None:
         stack = [(self.root_node, 0)]
         while stack:
             node, indent = stack.pop()
             component_str = " ".join(
-                f"{component_name}={'yes' if node.component_value(component_name) is not None else 'no'}"
-                for component_name in self.tree_components
+                f"{ct}={'yes' if node.component_value(ct) is not None else 'no'}"
+                for ct in self.tree_components
             )
             print(
                 " " * indent,
                 f"[{node.id}]",
                 len(node.key),
-                f"full_lock={node.component(BASE_COMPONENT_NAME).lock_ref}",
+                f"full_lock={node.component(BASE_COMPONENT_TYPE).lock_ref}",
                 component_str,
             )
             for child in node.children.values():

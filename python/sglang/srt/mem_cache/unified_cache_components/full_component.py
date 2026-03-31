@@ -8,7 +8,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
 )
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
-    ComponentName,
+    ComponentType,
     TreeComponent,
 )
 
@@ -20,8 +20,8 @@ if TYPE_CHECKING:
 
 class FullComponent(TreeComponent):
     @property
-    def name(self) -> ComponentName:
-        return ComponentName.FULL
+    def component_type(self) -> ComponentType:
+        return ComponentType.FULL
 
     def node_has_component_data(self, node: UnifiedTreeNode) -> bool:
         # Override so _for_each_component_lru includes Full in LRU operations
@@ -33,12 +33,14 @@ class FullComponent(TreeComponent):
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
     ):
-        new_parent.component(self.name).lock_ref = child.component(self.name).lock_ref
+        new_parent.component(self.component_type).lock_ref = child.component(
+            self.component_type
+        ).lock_ref
 
     def evict_component(self, node: UnifiedTreeNode, is_leaf: bool) -> int:
         self.cache.token_to_kv_pool_allocator.free(node.full_value)
         freed = len(node.full_value)
-        self.cache.component_evictable_size_[self.name] -= freed
+        self.cache.component_evictable_size_[self.component_type] -= freed
         return freed
 
     def eviction_priority(self, is_leaf: bool) -> int:
@@ -46,8 +48,8 @@ class FullComponent(TreeComponent):
 
     def drive_eviction(self, params: EvictParams, tracker: dict[str, int]) -> None:
         request = params.num_tokens
-        lru = self.cache.lru_lists[self.name]
-        while tracker[self.name] < request:
+        lru = self.cache.lru_lists[self.component_type]
+        while tracker[self.component_type] < request:
             x = lru.get_leaf_lru_no_lock()
             if x is None:
                 break
@@ -61,10 +63,14 @@ class FullComponent(TreeComponent):
     ) -> IncLockRefResult:
         cur = node
         while cur != self.cache.root_node:
-            if cur.component(self.name).lock_ref == 0:
-                self.cache.component_evictable_size_[self.name] -= len(cur.full_value)
-                self.cache.component_protected_size_[self.name] += len(cur.full_value)
-            cur.component(self.name).lock_ref += 1
+            if cur.component(self.component_type).lock_ref == 0:
+                self.cache.component_evictable_size_[self.component_type] -= len(
+                    cur.full_value
+                )
+                self.cache.component_protected_size_[self.component_type] += len(
+                    cur.full_value
+                )
+            cur.component(self.component_type).lock_ref += 1
             cur = cur.parent
         return result
 
@@ -73,9 +79,13 @@ class FullComponent(TreeComponent):
     ) -> None:
         cur = node
         while cur != self.cache.root_node:
-            assert cur.component(self.name).lock_ref > 0
-            if cur.component(self.name).lock_ref == 1:
-                self.cache.component_evictable_size_[self.name] += len(cur.full_value)
-                self.cache.component_protected_size_[self.name] -= len(cur.full_value)
-            cur.component(self.name).lock_ref -= 1
+            assert cur.component(self.component_type).lock_ref > 0
+            if cur.component(self.component_type).lock_ref == 1:
+                self.cache.component_evictable_size_[self.component_type] += len(
+                    cur.full_value
+                )
+                self.cache.component_protected_size_[self.component_type] -= len(
+                    cur.full_value
+                )
+            cur.component(self.component_type).lock_ref -= 1
             cur = cur.parent
