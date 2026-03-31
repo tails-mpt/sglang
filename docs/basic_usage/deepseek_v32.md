@@ -1,10 +1,9 @@
-# DeepSeek V3.2 Usage
+# DeepSeek V3.2/GLM-5 Usage
 
 DeepSeek-V3.2 model family equips DeepSeek-V3.1-Terminus with DeepSeek Sparse Attention (DSA) through continued training. With DSA, a fine-grained sparse attention mechanism powered by a lightning indexer, DeepSeek-V3.2 achieves efficiency improvements in long-context scenarios.
 
-For reporting issues or tracking upcoming features, please refer to this [Roadmap](https://github.com/sgl-project/sglang/issues/11060).
 
-Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) model. The usage of [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) or [DeepSeek-V3.2-Speciale](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Speciale) is the same as DeepSeek-V3.2-Exp except for the tool call parser.
+Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) model. The usage of [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) or [DeepSeek-V3.2-Speciale](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Speciale) is the same as DeepSeek-V3.2-Exp except for the tool call parser. [GLM-5](https://huggingface.co/zai-org/GLM-5) model also applies DSA(Deepseek sparse attention) structure, so can share most of the usage here, except for reasoning parser and tool call parser.
 
 
 ## Installation
@@ -38,7 +37,8 @@ cd sglang
 pip3 install pip --upgrade
 pip3 install -e "python"
 ```
-## Launch DeepSeek V3.2 with SGLang
+
+## Launch DeepSeek V3.2/GLM-5 with SGLang
 
 To serve [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) on 8xH200/B200 GPUs:
 
@@ -55,6 +55,8 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8
 # Launch with TP on MI30x/MI35x
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --nsa-prefill-backend tilelang --nsa-decode-backend tilelang
 ```
+
+To server GLM-5, just replace the `--model` argument with `zai-org/GLM-5-FP8`.
 
 ### Configuration Tips
 - **DP Attention (Recommended)**: For DeepSeek V3.2 model, the kernels are customized for the use case of `dp_size=8`, so DP attention (`--dp 8 --enable-dp-attention`) is the recommended configuration for better stability and performance. All test cases use this configuration by default.
@@ -127,6 +129,15 @@ python3 -m sglang.launch_server \
   --trust-remote-code \
   --tp-size 8 --dp-size 8 --enable-dp-attention \
   --reasoning-parser deepseek-v3
+```
+
+To launch `GLM-5` with function calling and reasoning parser:
+```bash
+python -m sglang.launch_server \
+  --model zai-org/GLM-5-FP8 \
+  --tp-size 8 --dp-size 8 --enable-dp-attention \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
 ```
 
 ## NVFP4 Checkpoint
