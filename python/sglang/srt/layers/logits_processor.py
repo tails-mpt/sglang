@@ -511,6 +511,10 @@ class LogitsProcessor(nn.Module):
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
                     aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+                    # Cast to bfloat16 to match Eagle3 draft model weights
+                    # (FP8 target models produce float32 after dequantization)
+                    if aux_hidden_states.dtype != torch.bfloat16:
+                        aux_hidden_states = aux_hidden_states.to(torch.bfloat16)
                     hidden_states_to_store = aux_hidden_states
                 else:
                     hidden_states_to_store = hidden_states

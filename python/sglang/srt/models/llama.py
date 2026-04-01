@@ -702,6 +702,12 @@ class LlamaForCausalLM(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
+        # Cast to bfloat16 to match draft model weights
+        # (FP8 target models may have float16/float32 embeddings)
+        if embed.dtype != torch.bfloat16:
+            embed = embed.to(torch.bfloat16)
+        if head.dtype != torch.bfloat16:
+            head = head.to(torch.bfloat16)
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
@@ -719,6 +725,10 @@ class LlamaForCausalLM(nn.Module):
             and self.config.target_hidden_size != self.config.hidden_size
         ):
             return
+        # Cast to bfloat16 to match draft model weights
+        # (FP8 target models may have float16/float32 embeddings)
+        if embed.dtype != torch.bfloat16:
+            embed = embed.to(torch.bfloat16)
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
         torch.cuda.empty_cache()
