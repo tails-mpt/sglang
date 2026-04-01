@@ -159,6 +159,9 @@ class LlamaModel(nn.Module):
             positions = forward_batch.mrope_positions
 
         hidden_states = forward_batch.spec_info.hidden_states
+        # Cast to match FC weight dtype (FP8 targets produce float32 aux states)
+        if hidden_states.dtype != self.fc.weight.dtype:
+            hidden_states = hidden_states.to(self.fc.weight.dtype)
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
 
