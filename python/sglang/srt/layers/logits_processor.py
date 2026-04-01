@@ -519,6 +519,10 @@ class LogitsProcessor(nn.Module):
                 # pruned states only contain the last tokens already.
                 if aux_hidden_states is not None:
                     aux_pruned_states = torch.cat(aux_pruned_states, dim=-1)
+                    # Cast to bfloat16 to match Eagle3 draft model weights
+                    # (FP8 target models produce float32 after dequantization)
+                    if aux_pruned_states.dtype != torch.bfloat16:
+                        aux_pruned_states = aux_pruned_states.to(torch.bfloat16)
                     hidden_states_to_store = (
                         aux_pruned_states[sample_indices]
                         if sample_indices is not None

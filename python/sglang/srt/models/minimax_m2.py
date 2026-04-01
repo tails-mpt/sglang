@@ -771,10 +771,10 @@ class MiniMaxM2ForCausalLM(nn.Module):
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [
-                2,
-                num_layers // 2,
-                num_layers - 3,
-            ]  # Specific layers for EAGLE3 support
+                1,
+                num_layers // 2 - 1,
+                num_layers - 4,
+            ]  # Eagle3 standard: early, middle, near-final layers
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
