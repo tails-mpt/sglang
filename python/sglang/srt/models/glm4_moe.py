@@ -1501,4 +1501,32 @@ class Glm4MoeLiteForCausalLM(Glm4MoeForCausalLM):
     pass
 
 
-EntryClass = [Glm4MoeForCausalLM, Glm4MoeLiteForCausalLM]
+# GLM-5 (GLM MoE DSA) - same MoE+MLA architecture with Dynamic Sparse Attention indexer
+# The DSA indexer weights (self_attn.indexer.*) are skipped during loading since
+# standard attention inference doesn't use them. Config differences handled below.
+class GlmMoeDsaForCausalLM(Glm4MoeForCausalLM):
+    """GLM-5 model - uses same MoE+MLA implementation as Glm4MoeForCausalLM.
+
+    GLM-5 differs from GLM-4.7 in scale (78 layers, 256 experts, hidden=6144)
+    and adds a DSA (Dynamic Sparse Attention) indexer module. The indexer weights
+    are loaded but not used in the standard forward path.
+    """
+
+    def __init__(self, *args, **kwargs):
+        # GLM-5 config may use 'n_routed_experts' instead of 'num_local_experts'
+        config = args[0] if args else kwargs.get("config")
+        if config is not None and not hasattr(config, "num_local_experts"):
+            config.num_local_experts = getattr(config, "n_routed_experts", 256)
+        if config is not None and not hasattr(config, "n_group"):
+            config.n_group = getattr(config, "n_group", 1)
+        if config is not None and not hasattr(config, "topk_group"):
+            config.topk_group = getattr(config, "topk_group", 1)
+        if config is not None and not hasattr(config, "kv_lora_rank"):
+            # GLM-5 doesn't explicitly set kv_lora_rank; derive from weight dims
+            # kv_a_proj_with_mqa output = kv_lora_rank + qk_rope_head_dim
+            # For GLM-5: this is typically 512 + 64 = 576 or derived from config
+            config.kv_lora_rank = getattr(config, "kv_lora_rank", 512)
+        super().__init__(*args, **kwargs)
+
+
+EntryClass = [Glm4MoeForCausalLM, Glm4MoeLiteForCausalLM, GlmMoeDsaForCausalLM]

@@ -360,17 +360,26 @@ class ModelConfig:
         elif (
             "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
             or "Glm4MoeForCausalLM" in self.hf_config.architectures
+            or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
         ):
-            # GLM-4.7-Flash uses MLA architecture internally but we use MHA backend
-            # with expanded dimensions since proper MLA latent KV caching is not implemented
-            self.head_dim = self.hf_config.qk_nope_head_dim + self.hf_config.qk_rope_head_dim  # 256
-            self.attention_arch = AttentionArch.MHA
-            # Store MLA params for use in attention layer
-            self.kv_lora_rank = self.hf_config.kv_lora_rank
-            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
-            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
-            self.v_head_dim = self.hf_config.v_head_dim
-            self.q_lora_rank = self.hf_config.q_lora_rank
+            # GLM-4 MoE family: some variants use MLA (GLM-4.7-Flash, GLM-5),
+            # others use standard MHA (GLM-4.7). Check for MLA config params.
+            _has_mla = hasattr(self.hf_config, 'qk_nope_head_dim') and self.hf_config.qk_nope_head_dim is not None
+            if _has_mla:
+                self.head_dim = self.hf_config.qk_nope_head_dim + self.hf_config.qk_rope_head_dim  # 256
+                self.attention_arch = AttentionArch.MHA
+                # Store MLA params for use in attention layer
+                self.kv_lora_rank = self.hf_config.kv_lora_rank
+                self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+                self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+                self.v_head_dim = self.hf_config.v_head_dim
+                self.q_lora_rank = self.hf_config.q_lora_rank
+            else:
+                # Standard MHA (e.g., GLM-4.7 full model)
+                # Use explicit head_dim from config if available (GLM-4.7 uses head_dim=128
+                # with hidden_size=5120 and num_heads=96, so hidden_size/num_heads != head_dim)
+                self.head_dim = getattr(self.hf_config, 'head_dim', self.hf_config.hidden_size // self.hf_config.num_attention_heads)
+                self.attention_arch = AttentionArch.MHA
 
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
