@@ -400,6 +400,16 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+        elif (
+            "Gemma4ForConditionalGeneration" in self.hf_config.architectures
+            or "Gemma4ForCausalLM" in self.hf_config.architectures
+        ):
+            # Gemma-4 has per-layer head dims: sliding=head_dim(256), global=global_head_dim(512)
+            # Use head_dim=256 for KV cache. Global attention layers handle their
+            # 512-dim heads internally by using separate projection.
+            text_config = getattr(self.hf_config, 'text_config', self.hf_config)
+            self.head_dim = getattr(text_config, 'head_dim', 256)
+            self.attention_arch = AttentionArch.MHA
         elif "KimiLinearForCausalLM" in self.hf_config.architectures:
             self.head_dim = 72
             self.attention_arch = AttentionArch.MLA

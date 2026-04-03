@@ -145,10 +145,22 @@ class Gemma4Attention(nn.Module):
 
         hidden_size = config.hidden_size
 
-        head_dim = getattr(
-            config, "head_dim", hidden_size // config.num_attention_heads
-        )
+        # Gemma-4 uses different head_dim for sliding vs full attention layers
+        layer_types = getattr(config, "layer_types", [])
+        is_sliding = layer_types[layer_id] == "sliding_attention" if layer_id < len(layer_types) else True
+        self.is_sliding = is_sliding
+
+        if is_sliding:
+            head_dim = getattr(config, "head_dim", hidden_size // config.num_attention_heads)
+            num_kv_heads_for_layer = self.total_num_kv_heads
+        else:
+            # Full attention layers use global_head_dim and may have fewer KV heads
+            head_dim = getattr(config, "global_head_dim", getattr(config, "head_dim", hidden_size // config.num_attention_heads))
+            num_kv_heads_for_layer = getattr(config, "num_global_key_value_heads", self.total_num_kv_heads)
+
         self.head_dim = head_dim
+        self.total_num_kv_heads_layer = num_kv_heads_for_layer
+        self.num_kv_heads = max(1, num_kv_heads_for_layer // tp_size)
 
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -161,7 +173,7 @@ class Gemma4Attention(nn.Module):
             hidden_size,
             self.head_dim,
             self.total_num_heads,
-            self.total_num_kv_heads,
+            num_kv_heads_for_layer,
             bias=config.attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
@@ -173,8 +185,6 @@ class Gemma4Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-
-        self.is_sliding = config.layer_types[layer_id] == "sliding_attention"
 
         # Initialize the rotary embedding.
         if self.is_sliding:
@@ -199,8 +209,8 @@ class Gemma4Attention(nn.Module):
         )
 
         # Gemma3/4 adds normalization for q and k
-        self.q_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = Gemma3RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Gemma3RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,

@@ -1157,6 +1157,8 @@ class ServerArgs:
             "Gemma3ForConditionalGeneration",
             "Gemma3nForCausalLM",
             "Gemma3nForConditionalGeneration",
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
         ]:
             # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
             # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
