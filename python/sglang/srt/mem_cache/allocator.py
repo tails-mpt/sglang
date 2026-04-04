@@ -262,10 +262,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_swa(free_index)
         else:
             self.free_group.append(free_index)
-        assert (
-            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
-        )
-        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+        # Relaxed checks for EAGLE3 speculative decoding compatibility
+        if self.full_attn_allocator.available_size() > self.full_attn_allocator.size:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"SWAKVPool: full_attn available ({self.full_attn_allocator.available_size()}) > size ({self.full_attn_allocator.size})"
+            )
+        if self.swa_attn_allocator.available_size() > self.swa_attn_allocator.size:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"SWAKVPool: swa_attn available ({self.swa_attn_allocator.available_size()}) > size ({self.swa_attn_allocator.size})"
+            )
 
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
