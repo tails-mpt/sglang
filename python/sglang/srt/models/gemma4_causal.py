@@ -181,7 +181,9 @@ class Gemma4Attention(nn.Module):
 
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = getattr(config, "query_pre_attn_scalar", head_dim)**-0.5
+        # Gemma-4: scaling=1.0 (not 1/sqrt(d)). Q and K are already normalized via q_norm/k_norm.
+        # HF source: self.scaling = 1.0 in Gemma4TextAttention.__init__
+        self.scaling = 1.0
 
         self.attention_k_eq_v = getattr(config, "attention_k_eq_v", False)
 
@@ -238,9 +240,6 @@ class Gemma4Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # Gemma-4: V comes from v_proj (via qkv_proj split), NOT from K clone
-        # attention_k_eq_v doesn't mean shared projections — checkpoint has distinct v_proj weights
-
         # [s, h, head_dim]
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
         q = q.transpose(0, 1).unsqueeze(0)
@@ -249,35 +248,38 @@ class Gemma4Attention(nn.Module):
         k = k.transpose(0, 1).unsqueeze(0)
         k = self.k_norm(k)
 
-        # Gemma-4: v_norm is RMSNorm without scale
-        # Temporarily disabled for debugging — checking if v_proj alone is correct
-        # v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-        # v_float = v.float()
-        # v = (v_float * torch.rsqrt(v_float.pow(2).mean(-1, keepdim=True) + self.v_norm_eps)).to(v.dtype)
-        # v = v.flatten(-2)
+        # Gemma-4 attention_k_eq_v: global layers have NO v_proj weights.
+        # V = K for global layers; sliding layers use v_proj + v_norm.
+        if self.attention_k_eq_v and not self.is_sliding:
+            # Global layer: V = K (no v_proj in checkpoint)
+            # k is [1, num_kv_heads, s, head_dim] after reshape above
+            # v needs to be flat [s, num_kv_heads * head_dim] for RadixAttention
+            v = k.squeeze(0).transpose(0, 1).flatten(-2, -1)
+        else:
+            # Sliding layer: v comes from v_proj, apply v_norm (RMSNorm without scale)
+            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            v_float = v.float()
+            v = (v_float * torch.rsqrt(v_float.pow(2).mean(-1, keepdim=True) + self.v_norm_eps)).to(v.dtype)
+            v = v.flatten(-2)
 
         cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # Gemma-4 global layers: partial_rotary_factor=0.25 means cos/sin dim (128)
+        # is smaller than head_dim (512). Only rotate the first cos.shape[-1] dims.
+        rotary_dim = cos.shape[-1]
+        q_head_dim = q.shape[-1]
+        if rotary_dim < q_head_dim:
+            q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+            k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+            q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
+            q = torch.cat([q_rot, q_pass], dim=-1)
+            k = torch.cat([k_rot, k_pass], dim=-1)
+        else:
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # [b, h, s, head_dim] ->  [b, s, h, head_dim]
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
-
-        # With SWAKVPool, each layer type has its own KV cache — no padding needed
-
-        # DEBUG: print shapes for first forward pass
-        if self.layer_id == 0 and not hasattr(self, '_debug_printed'):
-            self._debug_printed = True
-            import sys
-            print(f"[DEBUG L{self.layer_id} {'sliding' if self.is_sliding else 'global'}] "
-                  f"q={q.shape} k={k.shape} v_flat={v.shape} "
-                  f"head_dim={self.head_dim} num_kv={self.num_kv_heads}", file=sys.stderr, flush=True)
-        if self.layer_id == 5 and not hasattr(self, '_debug_printed'):
-            self._debug_printed = True
-            import sys
-            print(f"[DEBUG L{self.layer_id} {'sliding' if self.is_sliding else 'global'}] "
-                  f"q={q.shape} k={k.shape} v_flat={v.shape} "
-                  f"head_dim={self.head_dim} num_kv={self.num_kv_heads}", file=sys.stderr, flush=True)
 
         attn_output = self.attn(q, k, v, forward_batch=forward_batch)
 
@@ -549,17 +551,6 @@ class Gemma4TextModel(PreTrainedModel):
         else:
             hidden_states = input_embeds
 
-        # DEBUG: track hidden state magnitude through layers
-        if not hasattr(self, '_layer_debug_done'):
-            self._layer_debug_done = True
-            self._debug_mode = True
-            import sys
-            h = hidden_states.float()
-            print(f"[DEBUG] Embedding: mean={h.mean():.4f} std={h.std():.4f} "
-                  f"min={h.min():.4f} max={h.max():.4f}", file=sys.stderr, flush=True)
-        else:
-            self._debug_mode = False
-
         if positions.dim() == 1:
             positions = einops.rearrange(positions, "s -> 1 s")
 
@@ -579,12 +570,6 @@ class Gemma4TextModel(PreTrainedModel):
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
-
-            if getattr(self, '_debug_mode', False) and i in [0, 5, 10, 30, 59]:
-                import sys
-                h = hidden_states.float()
-                print(f"[DEBUG] After layer {i}: mean={h.mean():.4f} std={h.std():.4f} "
-                      f"min={h.min():.4f} max={h.max():.4f}", file=sys.stderr, flush=True)
 
         hidden_states = self.norm(hidden_states)
 
@@ -760,17 +745,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
-        # DEBUG: print first forward pass logits
-        if not hasattr(self, '_logits_debug_printed'):
-            self._logits_debug_printed = True
-            import sys
-            if hasattr(result, 'next_token_logits') and result.next_token_logits is not None:
-                logits = result.next_token_logits
-                top5 = logits[0].topk(5)
-                print(f"[DEBUG LOGITS] shape={logits.shape}, top5_vals={top5.values.tolist()}, top5_ids={top5.indices.tolist()}", file=sys.stderr, flush=True)
-            print(f"[DEBUG HIDDEN] hidden_states shape={hidden_states.shape}, "
-                  f"mean={hidden_states.float().mean():.6f}, std={hidden_states.float().std():.6f}", file=sys.stderr, flush=True)
-
         return result
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -824,21 +798,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
-
-        # DEBUG: verify layernorm weights loaded correctly
-        import sys
-        all_params = set(params_dict.keys())
-        missing = all_params - loaded_params
-        if missing:
-            print(f"[WARN] {len(missing)} params not loaded:", file=sys.stderr, flush=True)
-            for m in sorted(missing)[:10]:
-                print(f"  {m}: {params_dict[m].shape}", file=sys.stderr, flush=True)
-
-        # Check specific weights
-        for key in ["model.layers.0.input_layernorm.weight", "model.norm.weight"]:
-            if key in params_dict:
-                w = params_dict[key]
-                print(f"[DEBUG WEIGHT] {key}: mean={w.float().mean():.4f} std={w.float().std():.4f}", file=sys.stderr, flush=True)
 
         return loaded_params
 
