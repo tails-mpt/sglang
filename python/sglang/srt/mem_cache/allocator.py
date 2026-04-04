@@ -257,28 +257,27 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+
+        # Guard against double-free: only free indices whose SWA mapping is valid (>= 0).
+        # EAGLE3 speculative decoding can call free() on already-freed indices during
+        # tree verification rejection. Without this guard, available_size exceeds total_size
+        # and subsequent allocations cause OOB CUDA memory access.
+        valid_mask = self.full_to_swa_index_mapping[free_index] >= 0
+        free_index = free_index[valid_mask]
+        if free_index.numel() == 0:
+            return
+
         if self.is_not_in_free_group:
             self.full_attn_allocator.free(free_index)
             self.free_swa(free_index)
         else:
             self.free_group.append(free_index)
-        # Relaxed checks for EAGLE3 speculative decoding compatibility
-        if self.full_attn_allocator.available_size() > self.full_attn_allocator.size:
-            import logging
-            logging.getLogger(__name__).warning(
-                f"SWAKVPool: full_attn available ({self.full_attn_allocator.available_size()}) > size ({self.full_attn_allocator.size})"
-            )
-        if self.swa_attn_allocator.available_size() > self.swa_attn_allocator.size:
-            import logging
-            logging.getLogger(__name__).warning(
-                f"SWAKVPool: swa_attn available ({self.swa_attn_allocator.available_size()}) > size ({self.swa_attn_allocator.size})"
-            )
 
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
-        swa_indices = swa_indices[swa_indices > 0]
+        swa_indices = swa_indices[swa_indices >= 0]
         self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[free_index] = 0
+        self.full_to_swa_index_mapping[free_index] = -1
 
     def backup_state(self):
         return [
@@ -294,7 +293,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         self.swa_attn_allocator.clear()
         self.full_attn_allocator.clear()
-        self.full_to_swa_index_mapping.fill_(0)
+        self.full_to_swa_index_mapping.fill_(-1)
         self.is_not_in_free_group = True
         self.free_group = []
 
