@@ -264,18 +264,11 @@ class Gemma4Attention(nn.Module):
 
         cos, sin = position_embeddings
 
-        # Gemma-4 global layers: partial_rotary_factor=0.25 means cos/sin dim (128)
-        # is smaller than head_dim (512). Only rotate the first cos.shape[-1] dims.
-        rotary_dim = cos.shape[-1]
-        q_head_dim = q.shape[-1]
-        if rotary_dim < q_head_dim:
-            q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-            k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-            q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
-            q = torch.cat([q_rot, q_pass], dim=-1)
-            k = torch.cat([k_rot, k_pass], dim=-1)
-        else:
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        # Gemma-4 proportional RoPE: inv_freq has 256 elements → cos/sin have dim 512,
+        # matching global_head_dim. High-frequency components naturally decay to 1.0/0.0,
+        # so no partial splitting is needed. For sliding layers, cos/sin have dim 256
+        # matching head_dim. Both paths use full-dimension apply_rotary_pos_emb.
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # [b, h, s, head_dim] ->  [b, s, h, head_dim]
         q = q.permute(0, 2, 1, 3)

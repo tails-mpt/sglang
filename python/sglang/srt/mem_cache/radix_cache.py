@@ -541,7 +541,7 @@ class RadixCache(BasePrefixCache):
     def total_size(self):
         return self._total_size_helper()
 
-    def evict(self, num_tokens: int):
+    def evict(self, num_tokens: int, swa_num_tokens: int = 0):
         if self.disable:
             return
 
