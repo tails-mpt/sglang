@@ -41,6 +41,23 @@ from transformers import (
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
+
+
+class Gemma4RMSNorm(nn.Module):
+    """Gemma-4 RMSNorm: uses weight directly (not 1+weight like Gemma-3)."""
+    def __init__(self, dim: int, eps: float = 1e-6, with_scale: bool = True):
+        super().__init__()
+        self.eps = eps
+        self.with_scale = with_scale
+        if self.with_scale:
+            self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output = x.float()
+        output = output * torch.rsqrt(output.pow(2).mean(-1, keepdim=True) + self.eps)
+        if self.with_scale:
+            output = output * self.weight.float()
+        return output.type_as(x)
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -164,9 +181,8 @@ class Gemma4Attention(nn.Module):
 
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = config.query_pre_attn_scalar**-0.5
+        self.scaling = getattr(config, "query_pre_attn_scalar", head_dim)**-0.5
 
-        # Gemma-4: attention_k_eq_v means k and v share the same projection
         self.attention_k_eq_v = getattr(config, "attention_k_eq_v", False)
 
         self.qkv_proj = QKVParallelLinear(
@@ -186,16 +202,14 @@ class Gemma4Attention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # Initialize the rotary embedding.
+        # Sliding window config (RoPE is handled by Gemma4TextModel's rotary embeddings)
         if self.is_sliding:
-            self.rope_theta = config.rope_local_base_freq
-            self.rope_scaling = {"rope_type": "default"}
             self.sliding_window = get_attention_sliding_window_size(config)
         else:
-            self.rope_theta = config.rope_theta
-            self.rope_scaling = config.rope_scaling
             self.sliding_window = None
 
+        # With SWAKVPool, each layer type has its own KV cache with native dimensions.
+        # No padding/repeating needed — use layer-native dims directly.
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -208,9 +222,11 @@ class Gemma4Attention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
-        # Gemma3/4 adds normalization for q and k
-        self.q_norm = Gemma3RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Gemma3RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
+        # Gemma-4 adds normalization for q, k, AND v
+        self.q_norm = Gemma4RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Gemma4RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
+        # v_norm: RMSNorm WITHOUT learnable scale (no parameters, just normalization)
+        self.v_norm_eps = config.rms_norm_eps
 
     def forward(
         self,
@@ -222,9 +238,8 @@ class Gemma4Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # Gemma-4: when k and v share weights, v is a copy of k after projection
-        if self.attention_k_eq_v:
-            v = k.clone()
+        # Gemma-4: V comes from v_proj (via qkv_proj split), NOT from K clone
+        # attention_k_eq_v doesn't mean shared projections — checkpoint has distinct v_proj weights
 
         # [s, h, head_dim]
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
@@ -234,6 +249,13 @@ class Gemma4Attention(nn.Module):
         k = k.transpose(0, 1).unsqueeze(0)
         k = self.k_norm(k)
 
+        # Gemma-4: v_norm is RMSNorm without scale
+        # Temporarily disabled for debugging — checking if v_proj alone is correct
+        # v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+        # v_float = v.float()
+        # v = (v_float * torch.rsqrt(v_float.pow(2).mean(-1, keepdim=True) + self.v_norm_eps)).to(v.dtype)
+        # v = v.flatten(-2)
+
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
@@ -241,9 +263,25 @@ class Gemma4Attention(nn.Module):
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
 
+        # With SWAKVPool, each layer type has its own KV cache — no padding needed
+
+        # DEBUG: print shapes for first forward pass
+        if self.layer_id == 0 and not hasattr(self, '_debug_printed'):
+            self._debug_printed = True
+            import sys
+            print(f"[DEBUG L{self.layer_id} {'sliding' if self.is_sliding else 'global'}] "
+                  f"q={q.shape} k={k.shape} v_flat={v.shape} "
+                  f"head_dim={self.head_dim} num_kv={self.num_kv_heads}", file=sys.stderr, flush=True)
+        if self.layer_id == 5 and not hasattr(self, '_debug_printed'):
+            self._debug_printed = True
+            import sys
+            print(f"[DEBUG L{self.layer_id} {'sliding' if self.is_sliding else 'global'}] "
+                  f"q={q.shape} k={k.shape} v_flat={v.shape} "
+                  f"head_dim={self.head_dim} num_kv={self.num_kv_heads}", file=sys.stderr, flush=True)
+
         attn_output = self.attn(q, k, v, forward_batch=forward_batch)
 
-        # Compatible with triton backend which returns [1, s, h, head_dim]
+        # Handle output shape (triton backend returns [1, s, h, head_dim])
         if attn_output.dim() == 4 and attn_output.shape[0] == 1:
             attn_output = attn_output.squeeze(0)
             attn_output = attn_output.flatten(-2, -1)
@@ -277,16 +315,16 @@ class Gemma4DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-        self.input_layernorm = Gemma3RMSNorm(
+        self.input_layernorm = Gemma4RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm = Gemma3RMSNorm(
+        self.post_attention_layernorm = Gemma4RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.pre_feedforward_layernorm = Gemma3RMSNorm(
+        self.pre_feedforward_layernorm = Gemma4RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_feedforward_layernorm = Gemma3RMSNorm(
+        self.post_feedforward_layernorm = Gemma4RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.is_sliding = self.self_attn.is_sliding
@@ -330,8 +368,10 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        # Gemma-4: scale the residual contribution by the per-layer scalar
-        hidden_states = residual + hidden_states * self.layer_scalar
+        hidden_states = residual + hidden_states
+
+        # Gemma-4: layer_scalar scales the ENTIRE layer output (not just the MLP contribution)
+        hidden_states = hidden_states * self.layer_scalar
 
         outputs = (hidden_states,)
 
@@ -339,22 +379,46 @@ class Gemma4DecoderLayer(nn.Module):
 
 
 class Gemma4RotaryEmbedding(nn.Module):
-    def __init__(self, config: PretrainedConfig, device=None):
+    """
+    Gemma-4 rotary embedding supporting both sliding (default) and full (proportional) attention.
+
+    Following HF's Gemma4TextRotaryEmbedding:
+    - Sliding layers: standard RoPE with head_dim=256, theta=10000
+    - Full layers: proportional RoPE with global_head_dim=512, theta=1M, partial_rotary_factor=0.25
+      The proportional init produces inv_freq with dim=256 (64 rotary + 192 zero-freq),
+      yielding cos/sin of dim=512 that match global_head_dim.
+    """
+    def __init__(self, config: PretrainedConfig, device=None, layer_type="sliding_attention"):
         super().__init__()
-        # BC: "rope_type" was originally "type"
-        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type")
-            )
-        else:
-            self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
-
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.layer_type = layer_type
 
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        # Extract per-layer-type RoPE parameters from Gemma-4's nested config
+        rope_params = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
+        layer_params = rope_params.get(layer_type, {}) if isinstance(rope_params, dict) and layer_type in rope_params else rope_params
+
+        rope_type = layer_params.get("rope_type", "default") if isinstance(layer_params, dict) else "default"
+        self.rope_type = rope_type
+
+        if rope_type == "default" or rope_type not in ROPE_INIT_FUNCTIONS:
+            # Standard RoPE: compute inv_freq directly
+            base = layer_params.get("rope_theta", 10000.0) if isinstance(layer_params, dict) else 10000.0
+            dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+            inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+            self.attention_scaling = 1.0
+        elif rope_type == "proportional":
+            # Proportional RoPE for full attention layers
+            # Must pass head_dim_key="global_head_dim" so it uses 512 instead of 256
+            rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
+            inv_freq, self.attention_scaling = rope_init_fn(
+                config, device=device, layer_type=layer_type, head_dim_key="global_head_dim"
+            )
+        else:
+            rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
+            inv_freq, self.attention_scaling = rope_init_fn(config, device=device)
+
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
@@ -444,15 +508,15 @@ class Gemma4TextModel(PreTrainedModel):
             embed_scale=self.config.hidden_size**0.5,
         )
 
-        self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Gemma4RotaryEmbedding(config=config)
+        self.norm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
 
-        # Local RoPE config for sliding attention layers
-        local_config = copy.deepcopy(config)
-        local_config.rope_theta = config.rope_local_base_freq
-        local_config.rope_scaling = {"rope_type": "default"}
-        self.rotary_emb_local = Gemma4RotaryEmbedding(config=local_config)
+        # Gemma-4 uses per-layer-type RoPE:
+        # - Global (full_attention): proportional RoPE, global_head_dim=512, partial_rotary_factor=0.25
+        # - Local (sliding_attention): standard RoPE, head_dim=256
+        # Following HF's Gemma4TextRotaryEmbedding approach
+        self.rotary_emb = Gemma4RotaryEmbedding(config=config, layer_type="full_attention")
+        self.rotary_emb_local = Gemma4RotaryEmbedding(config=config, layer_type="sliding_attention")
 
         self.layers = make_layers(
             config.num_hidden_layers,
@@ -464,12 +528,13 @@ class Gemma4TextModel(PreTrainedModel):
             ),
             prefix=add_prefix("layers", prefix),
         )
-        self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # For EAGLE-3 support
         self.layers_to_capture = []
 
-        self.post_init()
+        # Skip post_init() — SGLang handles weight loading via load_weights()
+        # self.post_init()
 
     def forward(
         self,
@@ -483,6 +548,17 @@ class Gemma4TextModel(PreTrainedModel):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
+
+        # DEBUG: track hidden state magnitude through layers
+        if not hasattr(self, '_layer_debug_done'):
+            self._layer_debug_done = True
+            self._debug_mode = True
+            import sys
+            h = hidden_states.float()
+            print(f"[DEBUG] Embedding: mean={h.mean():.4f} std={h.std():.4f} "
+                  f"min={h.min():.4f} max={h.max():.4f}", file=sys.stderr, flush=True)
+        else:
+            self._debug_mode = False
 
         if positions.dim() == 1:
             positions = einops.rearrange(positions, "s -> 1 s")
@@ -504,6 +580,12 @@ class Gemma4TextModel(PreTrainedModel):
             )
             hidden_states = layer_outputs[0]
 
+            if getattr(self, '_debug_mode', False) and i in [0, 5, 10, 30, 59]:
+                import sys
+                h = hidden_states.float()
+                print(f"[DEBUG] After layer {i}: mean={h.mean():.4f} std={h.std():.4f} "
+                      f"min={h.min():.4f} max={h.max():.4f}", file=sys.stderr, flush=True)
+
         hidden_states = self.norm(hidden_states)
 
         if len(aux_hidden_states) == 0:
@@ -513,7 +595,8 @@ class Gemma4TextModel(PreTrainedModel):
 
 
 class Gemma4ForCausalLM(PreTrainedModel):
-    _tied_weights_keys = ["lm_head.weight"]
+    # transformers 5.5.0 expects dict for tied weights; use empty dict since we handle tying manually
+    _tied_weights_keys = {}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
     base_model_prefix = "language_model"
@@ -597,7 +680,10 @@ class Gemma4ForCausalLM(PreTrainedModel):
         # For EAGLE-3 support
         self.capture_aux_hidden_states = False
 
-        self.post_init()
+        # Skip post_init() — SGLang handles weight loading via load_weights().
+        # post_init() triggers _init_weights which calls ROPE_INIT_FUNCTIONS on
+        # our Gemma4RotaryEmbedding without the required layer_type context.
+        # self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -670,9 +756,22 @@ class Gemma4ForCausalLM(PreTrainedModel):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        return self.logits_processor(
+        result = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
+
+        # DEBUG: print first forward pass logits
+        if not hasattr(self, '_logits_debug_printed'):
+            self._logits_debug_printed = True
+            import sys
+            if hasattr(result, 'next_token_logits') and result.next_token_logits is not None:
+                logits = result.next_token_logits
+                top5 = logits[0].topk(5)
+                print(f"[DEBUG LOGITS] shape={logits.shape}, top5_vals={top5.values.tolist()}, top5_ids={top5.indices.tolist()}", file=sys.stderr, flush=True)
+            print(f"[DEBUG HIDDEN] hidden_states shape={hidden_states.shape}, "
+                  f"mean={hidden_states.float().mean():.6f}, std={hidden_states.float().std():.6f}", file=sys.stderr, flush=True)
+
+        return result
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -725,6 +824,21 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # DEBUG: verify layernorm weights loaded correctly
+        import sys
+        all_params = set(params_dict.keys())
+        missing = all_params - loaded_params
+        if missing:
+            print(f"[WARN] {len(missing)} params not loaded:", file=sys.stderr, flush=True)
+            for m in sorted(missing)[:10]:
+                print(f"  {m}: {params_dict[m].shape}", file=sys.stderr, flush=True)
+
+        # Check specific weights
+        for key in ["model.layers.0.input_layernorm.weight", "model.norm.weight"]:
+            if key in params_dict:
+                w = params_dict[key]
+                print(f"[DEBUG WEIGHT] {key}: mean={w.float().mean():.4f} std={w.float().std():.4f}", file=sys.stderr, flush=True)
 
         return loaded_params
 

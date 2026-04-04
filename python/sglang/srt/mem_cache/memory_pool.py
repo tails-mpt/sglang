@@ -551,6 +551,11 @@ class MHATokenToKVPool(KVCache):
         self.head_num = head_num
         self.head_dim = head_dim
 
+        # Support per-layer head_num and head_dim (for models like Gemma-4)
+        # These can be set by the model before server starts
+        self.per_layer_head_num = getattr(self, 'per_layer_head_num', None)
+        self.per_layer_head_dim = getattr(self, 'per_layer_head_dim', None)
+
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
@@ -617,22 +622,21 @@ class MHATokenToKVPool(KVCache):
             ):
                 # [size, head_num, head_dim] for each layer
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                # Supports per-layer dimensions for models with hybrid attention (e.g. Gemma-4)
+                self.k_buffer = []
+                self.v_buffer = []
+                for i in range(self.layer_num):
+                    layer_idx = i + (self.start_layer or 0)
+                    hn = self.per_layer_head_num[layer_idx] if self.per_layer_head_num else self.head_num
+                    hd = self.per_layer_head_dim[layer_idx] if self.per_layer_head_dim else self.head_dim
+                    self.k_buffer.append(torch.zeros(
+                        (self.size + self.page_size, hn, hd),
+                        dtype=self.store_dtype, device=self.device,
+                    ))
+                    self.v_buffer.append(torch.zeros(
+                        (self.size + self.page_size, hn, hd),
+                        dtype=self.store_dtype, device=self.device,
+                    ))
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -1154,6 +1158,9 @@ class SWAKVPool(KVCache):
         enable_kvcache_transpose: bool,
         device: str,
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        # Per-pool overrides for models with different dims (e.g. Gemma-4)
+        full_head_num: Optional[int] = None,
+        full_head_dim: Optional[int] = None,
         **kwargs,
     ):
         self.size = size
@@ -1169,8 +1176,6 @@ class SWAKVPool(KVCache):
 
         kwargs["page_size"] = 1
         kwargs["enable_memory_saver"] = False
-        kwargs["head_num"] = head_num
-        kwargs["head_dim"] = head_dim
         kwargs["device"] = device
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
@@ -1180,17 +1185,22 @@ class SWAKVPool(KVCache):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
+        # SWA pool uses sliding layer dims (default head_num/head_dim)
+        swa_kwargs = {**kwargs, "head_num": head_num, "head_dim": head_dim}
         self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,
             dtype=dtype,
             layer_num=self.swa_layer_nums,
-            **kwargs,
+            **swa_kwargs,
         )
+
+        # Full attention pool can use different dims (for models like Gemma-4)
+        full_kwargs = {**kwargs, "head_num": full_head_num or head_num, "head_dim": full_head_dim or head_dim}
         self.full_kv_pool = token_to_kv_pool_class(
             size=size,
             dtype=dtype,
             layer_num=self.full_layer_nums,
-            **kwargs,
+            **full_kwargs,
         )
         # {layer_id: (index, is_swa_layer)}
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}

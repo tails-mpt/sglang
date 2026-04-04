@@ -1900,6 +1900,12 @@ class ModelRunner:
             )
         else:
             if self.is_hybrid_swa:
+                # For Gemma-4: full attention layers have different head_dim and num_kv_heads
+                full_head_dim = getattr(self.model_config.hf_text_config, "global_head_dim", None)
+                full_head_num = getattr(self.model_config.hf_text_config, "num_global_key_value_heads", None)
+                if full_head_num is not None:
+                    full_head_num = max(1, full_head_num // get_attention_tp_size())
+
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
@@ -1912,6 +1918,8 @@ class ModelRunner:
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    full_head_num=full_head_num,
+                    full_head_dim=full_head_dim,
                 )
             elif config := self.mambaish_config:
                 extra_args = {}

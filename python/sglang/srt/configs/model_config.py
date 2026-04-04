@@ -405,8 +405,8 @@ class ModelConfig:
             or "Gemma4ForCausalLM" in self.hf_config.architectures
         ):
             # Gemma-4 has per-layer head dims: sliding=head_dim(256), global=global_head_dim(512)
-            # Use head_dim=256 for KV cache. Global attention layers handle their
-            # 512-dim heads internally by using separate projection.
+            # With SWAKVPool enabled, each layer type gets its own cache with native dims.
+            # Use sliding layer head_dim as the default (SWAKVPool overrides per layer type).
             text_config = getattr(self.hf_config, 'text_config', self.hf_config)
             self.head_dim = getattr(text_config, 'head_dim', 256)
             self.attention_arch = AttentionArch.MHA
