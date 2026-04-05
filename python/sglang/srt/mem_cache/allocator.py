@@ -207,6 +207,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             dtype=torch.int64,
             device=device,
         )
+        # Track which indices are currently allocated (for double-free guard)
+        self._allocated_mask = torch.zeros(
+            size + size_swa + 1,
+            dtype=torch.bool,
+            device=device,
+        )
         self.clear()
 
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
@@ -252,17 +258,18 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         alloc_full_indices = self.full_attn_allocator.alloc(need_size)
         alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
         self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        self._allocated_mask[alloc_full_indices] = True
         return alloc_full_indices
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
 
-        # Guard against double-free: only free indices whose SWA mapping is valid (>= 0).
-        # EAGLE3 speculative decoding can call free() on already-freed indices during
-        # tree verification rejection. Without this guard, available_size exceeds total_size
-        # and subsequent allocations cause OOB CUDA memory access.
-        valid_mask = self.full_to_swa_index_mapping[free_index] >= 0
+        # Guard against double-free: track allocated state in a separate tensor.
+        # EAGLE3 speculative decoding can call free() on already-freed indices.
+        # We use _allocated_mask (not the mapping itself) to track state, because
+        # the mapping must contain valid indices (not -1) for CUDA graph compatibility.
+        valid_mask = self._allocated_mask[free_index]
         free_index = free_index[valid_mask]
         if free_index.numel() == 0:
             return
@@ -275,9 +282,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
-        swa_indices = swa_indices[swa_indices >= 0]
         self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[free_index] = -1
+        self._allocated_mask[free_index] = False
+        # Reset mapping to 0 (valid index for CUDA graph compatibility, won't be used)
+        self.full_to_swa_index_mapping[free_index] = 0
 
     def backup_state(self):
         return [
@@ -293,7 +301,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         self.swa_attn_allocator.clear()
         self.full_attn_allocator.clear()
-        self.full_to_swa_index_mapping.fill_(-1)
+        self.full_to_swa_index_mapping.fill_(0)
+        self._allocated_mask.fill_(False)
         self.is_not_in_free_group = True
         self.free_group = []
 
