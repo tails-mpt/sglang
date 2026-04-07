@@ -238,7 +238,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 draft_input=EagleDraftInput.create_idle_input(
                     device=batch.device,
                     hidden_size=batch.model_config.hidden_size,
-                    dtype=batch.model_config.dtype,
+                    dtype=torch.bfloat16,
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 ),
@@ -600,7 +600,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 draft_input = EagleDraftInput.create_idle_input(
                     device=batch.device,
                     hidden_size=batch.model_config.hidden_size,
-                    dtype=batch.model_config.dtype,
+                    dtype=torch.bfloat16,
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )

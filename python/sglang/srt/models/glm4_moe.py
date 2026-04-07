@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only GLM-4.5, GLM-4.6 and GLM-4.7 model compatible with HuggingFace weights"""
+"""Inference-only GLM-4.5, GLM-4.6 model compatible with HuggingFace weights"""
 
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -51,8 +51,10 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -63,10 +65,6 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import (
-    RoutingMethodType,
-    filter_moe_weight_param_global_expert,
-)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -79,8 +77,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
-from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -94,7 +90,6 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -257,6 +252,28 @@ class Glm4MoeAttention(nn.Module):
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
 
+    def _apply_qk_norm(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # overlap qk norm
+        if self.alt_stream is not None and get_is_capture_mode():
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            q_by_head = q.reshape(-1, self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            with torch.cuda.stream(self.alt_stream):
+                k_by_head = k.reshape(-1, self.head_dim)
+                k_by_head = self.k_norm(k_by_head)
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            q_by_head = q.reshape(-1, self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            k_by_head = k.reshape(-1, self.head_dim)
+            k_by_head = self.k_norm(k_by_head)
+        q = q_by_head.view(q.shape)
+        k = k_by_head.view(k.shape)
+        return q, k
+
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
             positions=state.positions,
@@ -280,14 +297,7 @@ class Glm4MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
-            q, k = apply_qk_norm(
-                q=q,
-                k=k,
-                q_norm=self.q_norm,
-                k_norm=self.k_norm,
-                head_dim=self.head_dim,
-                alt_stream=self.alt_stream,
-            )
+            q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
@@ -314,6 +324,196 @@ class Glm4MoeAttention(nn.Module):
         return self.forward_core(s)
 
 
+class Glm4MoeAttentionMLA(nn.Module):
+    """
+    Multi-head Latent Attention (MLA) for GLM-4.7-Flash.
+    Based on DeepSeek V2 MLA implementation.
+
+    GLM-4.7-Flash uses MLA with:
+    - q_a_proj: hidden_size -> q_lora_rank
+    - q_a_layernorm: LayerNorm on q_lora_rank
+    - q_b_proj: q_lora_rank -> num_heads * qk_head_dim
+    - kv_a_proj_with_mqa: hidden_size -> kv_lora_rank + qk_rope_head_dim
+    - kv_a_layernorm: LayerNorm on kv_lora_rank
+    - kv_b_proj: kv_lora_rank -> num_heads * (qk_nope_head_dim + v_head_dim)
+    """
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        layer_id: int = 0,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self.hidden_size = hidden_size
+
+        # MLA config parameters
+        self.q_lora_rank = config.q_lora_rank
+        self.kv_lora_rank = config.kv_lora_rank
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.v_head_dim = config.v_head_dim
+
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+
+        self.num_heads = num_heads
+        assert num_heads % attn_tp_size == 0
+        self.num_local_heads = num_heads // attn_tp_size
+        self.scaling = self.qk_head_dim ** -0.5
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+
+        rms_norm_eps = config.rms_norm_eps
+
+        # Query path: hidden -> q_lora_rank -> num_heads * qk_head_dim
+        self.q_a_proj = ReplicatedLinear(
+            self.hidden_size,
+            self.q_lora_rank,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("q_a_proj", prefix),
+        )
+        self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=rms_norm_eps)
+        self.q_b_proj = ColumnParallelLinear(
+            self.q_lora_rank,
+            self.num_heads * self.qk_head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("q_b_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+        )
+
+        # KV path: hidden -> kv_lora_rank + qk_rope_head_dim -> num_heads * (qk_nope_head_dim + v_head_dim)
+        self.kv_a_proj_with_mqa = ReplicatedLinear(
+            self.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("kv_a_proj_with_mqa", prefix),
+        )
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=rms_norm_eps)
+        self.kv_b_proj = ColumnParallelLinear(
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("kv_b_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+        )
+
+        # Output projection
+        self.o_proj = RowParallelLinear(
+            self.num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=False,
+            prefix=add_prefix("o_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+        )
+
+        # RoPE - GLM uses interleaved style (is_neox_style=False)
+        self.rotary_emb = get_rope(
+            self.qk_rope_head_dim,
+            rotary_dim=self.qk_rope_head_dim,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+            is_neox_style=False,
+        )
+
+        # Attention
+        self.attn = RadixAttention(
+            self.num_local_heads,
+            self.qk_head_dim,
+            self.scaling,
+            num_kv_heads=self.num_local_heads,  # MLA effectively has same Q and KV heads after expansion
+            layer_id=layer_id,
+            v_head_dim=self.v_head_dim,
+            prefix=add_prefix("attn", prefix),
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        # Query path
+        q_compressed, _ = self.q_a_proj(hidden_states)
+        q_compressed = self.q_a_layernorm(q_compressed)
+        q, _ = self.q_b_proj(q_compressed)
+
+        # KV path
+        kv_compressed, _ = self.kv_a_proj_with_mqa(hidden_states)
+        # Split: first kv_lora_rank dims go through layernorm, last qk_rope_head_dim are k_rope
+        kv_compressed_for_norm = kv_compressed[..., :self.kv_lora_rank]
+        k_rope = kv_compressed[..., self.kv_lora_rank:]
+
+        kv_compressed_normed = self.kv_a_layernorm(kv_compressed_for_norm)
+        kv, _ = self.kv_b_proj(kv_compressed_normed)
+
+        # Reshape q: (batch*seq, num_local_heads * qk_head_dim) -> (batch*seq, num_local_heads, qk_head_dim)
+        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
+        q_nope, q_rope = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        # Make contiguous after split (split returns non-contiguous views)
+        q_nope = q_nope.contiguous()
+        q_rope = q_rope.contiguous()
+
+        # Reshape kv: split into k_nope and v
+        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        # Make contiguous after split
+        k_nope = k_nope.contiguous()
+        v = v.contiguous()
+
+        # k_rope is shared across heads (single head from MQA), keep as (tokens, 1, rope_dim)
+        k_rope = k_rope.view(-1, 1, self.qk_rope_head_dim).contiguous()
+
+        # Apply RoPE to rope portions
+        # RoPE expects (tokens, num_heads * head_dim) format
+        # q_rope: (tokens, num_heads, rope_dim) -> (tokens, num_heads * rope_dim)
+        # k_rope: (tokens, 1, rope_dim) -> (tokens, rope_dim)
+        q_rope_for_rope = q_rope.view(-1, self.num_local_heads * self.qk_rope_head_dim)
+        k_rope_for_rope = k_rope.view(-1, self.qk_rope_head_dim)
+
+        q_rope_rotated, k_rope_rotated = self.rotary_emb(positions, q_rope_for_rope, k_rope_for_rope)
+
+        # Reshape back
+        q_rope = q_rope_rotated.view(-1, self.num_local_heads, self.qk_rope_head_dim)
+        # k_rope is shared, expand to all heads and make contiguous (expand creates non-contiguous)
+        k_rope = k_rope_rotated.view(-1, 1, self.qk_rope_head_dim).expand(-1, self.num_local_heads, -1).contiguous()
+
+        # Concatenate nope and rope parts
+        q = torch.cat([q_nope, q_rope], dim=-1)
+        k = torch.cat([k_nope, k_rope], dim=-1)
+
+        # Flatten for attention - shape: (tokens, num_heads * head_dim)
+        q = q.view(-1, self.num_local_heads * self.qk_head_dim)
+        k = k.view(-1, self.num_local_heads * self.qk_head_dim)
+        v = v.view(-1, self.num_local_heads * self.v_head_dim)
+
+        # Attention
+        attn_output = self.attn(q, k, v, forward_batch)
+
+        # Output projection
+        output, _ = self.o_proj(attn_output)
+        return output
+
+
 class Glm4MoeGate(nn.Module):
     def __init__(
         self,
@@ -327,14 +527,9 @@ class Glm4MoeGate(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.empty((config.n_routed_experts), dtype=torch.float32)
         )
-        # GLM requires FP32 gate projection; cache to avoid per-forward cast.
-        # FIXME: if gate weight is updated at runtime (e.g. expert rebalancing), _weight_fp32 must be invalidated.
-        self.register_buffer("_weight_fp32", None, persistent=False)
 
     def forward(self, hidden_states):
-        if self._weight_fp32 is None:
-            self._weight_fp32 = self.weight.data.to(torch.float32)
-        logits = F.linear(hidden_states.to(torch.float32), self._weight_fp32, None)
+        logits = F.linear(hidden_states, self.weight, None)
         return logits
 
 
@@ -358,7 +553,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             if get_global_server_args().disable_shared_experts_fusion
             else config.n_shared_experts
         )
-
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
@@ -386,13 +580,11 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
-            routing_method_type=RoutingMethodType.DeepSeekV3,
             prefix=add_prefix("experts", prefix),
         )
 
         self.topk = TopK(
             top_k=self.top_k + self.num_fused_shared_experts,
-            layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
@@ -420,17 +612,12 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
-                    or get_moe_a2a_backend().is_flashinfer()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
             )
 
-        if (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_nixl()
-        ):
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -447,9 +634,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             )
 
         self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_nixl()
+            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
         )
 
     def get_moe_weights(self):
@@ -457,9 +642,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             x.data
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
-            and filter_moe_weight_param_global_expert(
-                name, x, self.experts.num_local_experts
-            )
         ]
 
     def forward(
@@ -690,10 +872,9 @@ class Glm4MoeDecoderLayer(nn.Module):
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
         self.config = config
-        rope_theta, rope_scaling = get_rope_config(config)
-        partial_rotary_factor = (rope_scaling or {}).get("partial_rotary_factor")
-        if partial_rotary_factor is None:
-            partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
@@ -702,36 +883,49 @@ class Glm4MoeDecoderLayer(nn.Module):
         attention_bias = config.attention_bias
         self.layer_id = layer_id
 
-        use_qk_norm = config.use_qk_norm if hasattr(config, "use_qk_norm") else False
+        # Use MLA attention if config has q_lora_rank (GLM-4.7-Flash uses MLA)
+        use_mla = hasattr(config, 'q_lora_rank') and config.q_lora_rank is not None
 
-        self.self_attn = Glm4MoeAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            partial_rotary_factor=partial_rotary_factor,
-            max_position_embeddings=max_position_embeddings,
-            head_dim=head_dim,
-            rms_norm_eps=rms_norm_eps,
-            attention_bias=attention_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
-            use_qk_norm=use_qk_norm,
-            alt_stream=alt_stream,
-        )
+        if use_mla:
+            self.self_attn = Glm4MoeAttentionMLA(
+                config=config,
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                layer_id=layer_id,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                quant_config=quant_config,
+                prefix=add_prefix("self_attn", prefix),
+            )
+        else:
+            self.self_attn = Glm4MoeAttention(
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                layer_id=layer_id,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                partial_rotary_factor=partial_rotary_factor,
+                max_position_embeddings=max_position_embeddings,
+                head_dim=head_dim,
+                rms_norm_eps=rms_norm_eps,
+                attention_bias=attention_bias,
+                quant_config=quant_config,
+                prefix=add_prefix("self_attn", prefix),
+                use_qk_norm=getattr(config, 'use_qk_norm', False),
+                alt_stream=alt_stream,
+            )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
-        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:
@@ -908,7 +1102,7 @@ class Glm4MoeModel(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                use_attn_tp_group=is_dp_attention_enabled(),
+                enable_tp=not is_dp_attention_enabled(),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -1118,14 +1312,24 @@ class Glm4MoeForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
+        # Check if using MLA (GLM-4.7-Flash)
+        use_mla = hasattr(self.config, 'q_lora_rank') and self.config.q_lora_rank is not None
+
+        if use_mla:
+            # For MLA, no QKV stacking needed - weights are loaded directly
+            stacked_params_mapping = [
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ]
+        else:
+            stacked_params_mapping = [
+                # (param_name, shard_name, shard_id)
+                ("qkv_proj", "q_proj", "q"),
+                ("qkv_proj", "k_proj", "k"),
+                ("qkv_proj", "v_proj", "v"),
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ]
 
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
@@ -1291,9 +1495,38 @@ class Glm4MoeForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
-class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
-    def determine_num_fused_shared_experts(self):
-        super().determine_num_fused_shared_experts("GlmMoeDsaForCausalLM")
+# GLM-4.7-Flash (GLM-4 MoE Lite) - wrapper class using same implementation
+class Glm4MoeLiteForCausalLM(Glm4MoeForCausalLM):
+    """GLM-4.7-Flash model - uses same implementation as Glm4MoeForCausalLM"""
+    pass
 
 
-EntryClass = [Glm4MoeForCausalLM, GlmMoeDsaForCausalLM]
+# GLM-5 (GLM MoE DSA) - same MoE+MLA architecture with Dynamic Sparse Attention indexer
+# The DSA indexer weights (self_attn.indexer.*) are skipped during loading since
+# standard attention inference doesn't use them. Config differences handled below.
+class GlmMoeDsaForCausalLM(Glm4MoeForCausalLM):
+    """GLM-5 model - uses same MoE+MLA implementation as Glm4MoeForCausalLM.
+
+    GLM-5 differs from GLM-4.7 in scale (78 layers, 256 experts, hidden=6144)
+    and adds a DSA (Dynamic Sparse Attention) indexer module. The indexer weights
+    are loaded but not used in the standard forward path.
+    """
+
+    def __init__(self, *args, **kwargs):
+        # GLM-5 config may use 'n_routed_experts' instead of 'num_local_experts'
+        config = args[0] if args else kwargs.get("config")
+        if config is not None and not hasattr(config, "num_local_experts"):
+            config.num_local_experts = getattr(config, "n_routed_experts", 256)
+        if config is not None and not hasattr(config, "n_group"):
+            config.n_group = getattr(config, "n_group", 1)
+        if config is not None and not hasattr(config, "topk_group"):
+            config.topk_group = getattr(config, "topk_group", 1)
+        if config is not None and not hasattr(config, "kv_lora_rank"):
+            # GLM-5 doesn't explicitly set kv_lora_rank; derive from weight dims
+            # kv_a_proj_with_mqa output = kv_lora_rank + qk_rope_head_dim
+            # For GLM-5: this is typically 512 + 64 = 576 or derived from config
+            config.kv_lora_rank = getattr(config, "kv_lora_rank", 512)
+        super().__init__(*args, **kwargs)
+
+
+EntryClass = [Glm4MoeForCausalLM, Glm4MoeLiteForCausalLM, GlmMoeDsaForCausalLM]
