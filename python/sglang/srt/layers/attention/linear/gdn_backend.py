@@ -15,6 +15,25 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+
+
+class _LayerKwargsProxy:
+    """Resolves attributes from kwargs first, then falls back to the layer object.
+    This bridges models like Qwen3Next that pass GDN weights via kwargs
+    instead of having them as direct attributes on the layer object."""
+
+    def __init__(self, layer, kwargs):
+        self._layer = layer
+        self._kwargs = kwargs
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            return object.__getattribute__(self, name)
+        if name in self._kwargs:
+            return self._kwargs[name]
+        if self._layer is not None:
+            return getattr(self._layer, name)
+        raise AttributeError(f"'{type(self._layer)}' has no attribute '{name}' and it's not in kwargs")
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -265,6 +284,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        layer = _LayerKwargsProxy(layer, kwargs)
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -340,6 +360,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        # Proxy resolves attrs from kwargs first (Qwen3Next passes GDN weights
+        # via kwargs), then falls back to layer object attributes
+        layer = _LayerKwargsProxy(layer, kwargs)
         assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
 

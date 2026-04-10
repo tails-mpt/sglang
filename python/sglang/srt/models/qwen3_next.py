@@ -307,7 +307,8 @@ class Qwen3GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
         )
 
-    # Properties required by the GDN attention backend (gdn_backend.py)
+    # Properties for GDN attention backend (gdn_backend.py) — only for
+    # attrs that don't conflict with instance attributes set in __init__
     @property
     def conv_weights(self):
         return self.conv1d.weight.view(
@@ -317,26 +318,6 @@ class Qwen3GatedDeltaNet(nn.Module):
     @property
     def bias(self):
         return self.conv1d.bias
-
-    @property
-    def num_q_heads(self):
-        return self.num_k_heads // self.attn_tp_size
-
-    @property
-    def head_q_dim(self):
-        return self.head_k_dim
-
-    @property
-    def q_dim(self):
-        return self.key_dim // self.attn_tp_size
-
-    @property
-    def k_dim(self):
-        return self.key_dim // self.attn_tp_size
-
-    @property
-    def v_dim(self):
-        return self.value_dim // self.attn_tp_size
 
     def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
         """
@@ -460,19 +441,24 @@ class Qwen3GatedDeltaNet(nn.Module):
             "conv_weights": conv_weights,
             "bias": self.conv1d.bias,
             "activation": self.activation,
-            "key_dim": self.key_dim,
-            "value_dim": self.value_dim,
+            "key_dim": self.key_dim // self.attn_tp_size,
+            "value_dim": self.value_dim // self.attn_tp_size,
             "attention_tp_size": self.attn_tp_size,
             "head_k_dim": self.head_k_dim,
             "head_v_dim": self.head_v_dim,
+            "head_q_dim": self.head_k_dim,
             "a": a,
             "b": b,
             "A_log": self.A_log,
             "dt_bias": self.dt_bias,
             "layer_id": self.layer_id,
             "seq_len": seq_len,
-            "num_k_heads": self.num_k_heads,
-            "num_v_heads": self.num_v_heads,
+            "num_k_heads": self.num_k_heads // self.attn_tp_size,
+            "num_v_heads": self.num_v_heads // self.attn_tp_size,
+            "num_q_heads": self.num_k_heads // self.attn_tp_size,
+            "q_dim": self.key_dim // self.attn_tp_size,
+            "k_dim": self.key_dim // self.attn_tp_size,
+            "v_dim": self.value_dim // self.attn_tp_size,
             "z": z,
         }
 
