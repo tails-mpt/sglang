@@ -320,6 +320,8 @@ class ModelRunner:
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
         self.init_new_workspace = False
+        self.use_ngram_embedding = getattr(model_config, 'use_ngram_embedding', False)
+        self.token_table = None
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
