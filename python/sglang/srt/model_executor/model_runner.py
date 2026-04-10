@@ -131,7 +131,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
-from sglang.srt.model_executor.input_buffers import GraphInputBuffers
+from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
@@ -2210,7 +2210,7 @@ class ModelRunner:
         if require_gathered_buffer(self.server_args):
             assert require_mlp_tp_gather_ or require_attn_tp_gather(self.server_args)
 
-        buffers: GraphInputBuffers = GraphInputBuffers.create(
+        buffers: ForwardInputBuffers = ForwardInputBuffers.create(
             device=self.device,
             max_bs=batch_size,
             max_num_token=num_tokens,
