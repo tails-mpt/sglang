@@ -307,6 +307,37 @@ class Qwen3GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
         )
 
+    # Properties required by the GDN attention backend (gdn_backend.py)
+    @property
+    def conv_weights(self):
+        return self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+
+    @property
+    def bias(self):
+        return self.conv1d.bias
+
+    @property
+    def num_q_heads(self):
+        return self.num_k_heads
+
+    @property
+    def head_q_dim(self):
+        return self.head_k_dim
+
+    @property
+    def q_dim(self):
+        return self.key_dim
+
+    @property
+    def k_dim(self):
+        return self.key_dim
+
+    @property
+    def v_dim(self):
+        return self.value_dim
+
     def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
