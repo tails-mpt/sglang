@@ -2143,7 +2143,7 @@ class ModelRunner:
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
-        if not self.server_args.enable_flashinfer_autotune:
+        if getattr(self.server_args, 'disable_flashinfer_autotune', True):
             return False
 
         backend_str = self.server_args.attention_backend
