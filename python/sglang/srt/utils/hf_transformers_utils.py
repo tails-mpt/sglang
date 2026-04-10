@@ -595,3 +595,17 @@ def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
     with open(model, "rb") as f:
         header = f.read(4)
     return header == b"GGUF"
+
+
+def get_rope_config(config):
+    """Get (rope_theta, rope_scaling) from config, supporting both v4 and v5.
+
+    In transformers v5, rope_theta/rope_scaling are accessed via the computed
+    property config.rope_parameters. Trust-remote-code configs or parent configs
+    passed to sub-models may not have this property or may return None.
+    Falls back to the v4-style config.rope_theta / config.rope_scaling attributes.
+    """
+    rope_params = getattr(config, "rope_parameters", None)
+    if rope_params is not None:
+        return rope_params["rope_theta"], rope_params
+    return config.rope_theta, getattr(config, "rope_scaling", None)

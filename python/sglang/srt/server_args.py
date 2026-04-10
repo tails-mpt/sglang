@@ -1069,7 +1069,7 @@ class ServerArgs:
 
         # Disable piecewise cuda graph with following conditions:
         # 1. Disable Model Arch
-        if self.get_model_config().is_piecewise_cuda_graph_disabled_model:
+        if getattr(self.get_model_config(), 'is_piecewise_cuda_graph_disabled_model', False):
             self.disable_piecewise_cuda_graph = True
         # 2. Speculative decoding
         if self.speculative_algorithm is not None:
