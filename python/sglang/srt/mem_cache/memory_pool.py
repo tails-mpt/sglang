@@ -103,7 +103,7 @@ class ReqToTokenPool:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, need_size: int) -> List[int]:
+    def alloc(self, need_size: int, reqs=None) -> List[int]:
         if need_size > len(self.free_slots):
             return None
 
@@ -261,7 +261,7 @@ class MambaPool:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+    def alloc(self, need_size: int, reqs=None) -> Optional[torch.Tensor]:
         if need_size > len(self.free_slots):
             return None
 
