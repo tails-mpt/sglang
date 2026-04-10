@@ -449,7 +449,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             q=None,
             k=None,
             v=None,
-            layer=None,
+            layer=self,
             forward_batch=forward_batch,
             **kwargs,
         )
