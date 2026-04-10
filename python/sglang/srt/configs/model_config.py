@@ -194,6 +194,7 @@ class ModelConfig:
             and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
         )
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
+        self.is_piecewise_cuda_graph_disabled_model = False  # Default; override per-model if needed
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
