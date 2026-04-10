@@ -265,7 +265,7 @@ class _LayerModeComputationContext:
     layer_id: int
     is_layer_sparse: bool
     is_previous_layer_sparse: Optional[bool]
-    is_next_layer_sparse: Optional[bool]
+    is_next_layer_sparse: Optional[bool] = None
 
     def previous_layer(self):
         assert self.is_previous_layer_sparse is not None
