@@ -63,3 +63,6 @@ class ForwardInputBuffers:
                 ), f"Field {name} is expected to be a torch.Tensor, a dict of torch.Tensor, or a dataclass of torch.Tensor, but got {type(buffer)}."
                 new_buffer = self._share_one_buffer(name, buffer)
                 setattr(self, name, new_buffer)
+
+# Backward compatibility alias
+GraphInputBuffers = ForwardInputBuffers
