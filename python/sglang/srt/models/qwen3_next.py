@@ -320,7 +320,7 @@ class Qwen3GatedDeltaNet(nn.Module):
 
     @property
     def num_q_heads(self):
-        return self.num_k_heads
+        return self.num_k_heads // self.attn_tp_size
 
     @property
     def head_q_dim(self):
@@ -328,15 +328,15 @@ class Qwen3GatedDeltaNet(nn.Module):
 
     @property
     def q_dim(self):
-        return self.key_dim
+        return self.key_dim // self.attn_tp_size
 
     @property
     def k_dim(self):
-        return self.key_dim
+        return self.key_dim // self.attn_tp_size
 
     @property
     def v_dim(self):
-        return self.value_dim
+        return self.value_dim // self.attn_tp_size
 
     def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
         """
