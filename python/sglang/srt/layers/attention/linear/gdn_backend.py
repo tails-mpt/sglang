@@ -15,25 +15,6 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-
-
-class _LayerKwargsProxy:
-    """Resolves attributes from kwargs first, then falls back to the layer object.
-    This bridges models like Qwen3Next that pass GDN weights via kwargs
-    instead of having them as direct attributes on the layer object."""
-
-    def __init__(self, layer, kwargs):
-        self._layer = layer
-        self._kwargs = kwargs
-
-    def __getattr__(self, name):
-        if name.startswith("_"):
-            return object.__getattribute__(self, name)
-        if name in self._kwargs:
-            return self._kwargs[name]
-        if self._layer is not None:
-            return getattr(self._layer, name)
-        raise AttributeError(f"'{type(self._layer)}' has no attribute '{name}' and it's not in kwargs")
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -274,6 +255,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        self.verify_intermediate_state_indices = torch.arange(
+            self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
+        )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        if self.forward_metadata.has_mamba_track_mask:
+            self.forward_metadata.mamba_track_mask_indices = (
+                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+            )
+            self.forward_metadata.conv_states_mask_indices = (
+                forward_batch.mamba_track_indices[
+                    self.forward_metadata.mamba_track_mask_indices
+                ]
+            )
 
     def forward_decode(
         self,
@@ -284,7 +280,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
-        layer = _LayerKwargsProxy(layer, kwargs)
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -360,9 +355,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
-        # Proxy resolves attrs from kwargs first (Qwen3Next passes GDN weights
-        # via kwargs), then falls back to layer object attributes
-        layer = _LayerKwargsProxy(layer, kwargs)
         assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
 
@@ -375,8 +367,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_next_sibling = forward_metadata.retrieve_next_sibling
         retrieve_parent_token = forward_metadata.retrieve_parent_token
 
-        layer_id = layer.layer_id if layer is not None else kwargs.get("layer_id")
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         if is_target_verify:
@@ -385,14 +376,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            has_initial_states = torch.ones(
-                seq_len // forward_batch.spec_info.draft_token_num,
-                dtype=torch.bool,
-                device=forward_batch.input_ids.device,
-            )
-            intermediate_state_indices = torch.arange(
-                cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
-            )
+            intermediate_state_indices = self.verify_intermediate_state_indices
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
@@ -418,16 +402,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
-            if (
-                forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
-            ):
-                conv_dst = forward_batch.mamba_track_indices
+            if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
-                mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-                conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
+                conv_states[forward_metadata.conv_states_mask_indices] = (
+                    mixed_qkv_to_track
+                )
 
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv,

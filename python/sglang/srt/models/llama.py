@@ -73,6 +73,7 @@ class LlamaMLP(nn.Module):
         reduce_results: bool = True,
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
+        use_dp_attention_reduce: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -93,6 +94,7 @@ class LlamaMLP(nn.Module):
             reduce_results=reduce_results,
             tp_rank=tp_rank,
             tp_size=tp_size,
+            use_dp_attention_reduce=use_dp_attention_reduce,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -252,8 +254,13 @@ class LlamaDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters["rope_theta"]
-        rope_scaling = config.rope_parameters
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if rope_parameters is not None:
+            rope_theta = rope_parameters.get("rope_theta", 10000)
+            rope_scaling = rope_parameters
+        else:
+            rope_theta = getattr(config, "rope_theta", 10000)
+            rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):
@@ -750,12 +757,6 @@ class LlamaForCausalLM(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        # Cast to bfloat16 to match draft model weights
-        # (FP8 target models may have float16/float32 embeddings)
-        if embed.dtype != torch.bfloat16:
-            embed = embed.to(torch.bfloat16)
-        if head.dtype != torch.bfloat16:
-            head = head.to(torch.bfloat16)
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
@@ -773,10 +774,6 @@ class LlamaForCausalLM(nn.Module):
             and self.config.target_hidden_size != self.config.hidden_size
         ):
             return
-        # Cast to bfloat16 to match draft model weights
-        # (FP8 target models may have float16/float32 embeddings)
-        if embed.dtype != torch.bfloat16:
-            embed = embed.to(torch.bfloat16)
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
         torch.cuda.empty_cache()
@@ -798,6 +795,18 @@ class LlamaForCausalLM(nn.Module):
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):

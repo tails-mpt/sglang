@@ -111,13 +111,17 @@ class LlamaModel(nn.Module):
         super().__init__()
         self.config = config
 
-        rope_scaling = config.rope_parameters
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if rope_parameters is not None:
+            rope_scaling = rope_parameters
+        else:
+            rope_scaling = getattr(config, "rope_scaling", None)
         self.is_mrope_enabled = (
             rope_scaling is not None and "mrope_section" in rope_scaling
         )
         # fix rope_scaling for qwen2.5-vl
         if self.is_mrope_enabled:
-            config.rope_parameters["rope_type"] = "default"
+            rope_scaling["rope_type"] = "default"
 
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
@@ -169,9 +173,6 @@ class LlamaModel(nn.Module):
             positions = forward_batch.mrope_positions
 
         hidden_states = forward_batch.spec_info.hidden_states
-        # Cast to match FC weight dtype (FP8 targets produce float32 aux states)
-        if hidden_states.dtype != self.fc.weight.dtype:
-            hidden_states = hidden_states.to(self.fc.weight.dtype)
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
 
