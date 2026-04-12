@@ -261,6 +261,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._allocated_mask[alloc_full_indices] = True
         return alloc_full_indices
 
+    def _assert_allocator_bounds(self):
+        assert self.full_attn_allocator.available_size() <= self._size_full
+        assert self.swa_attn_allocator.available_size() <= self._size_swa
+
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
@@ -268,7 +272,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # Filter invalid/negative indices early — the -1 sentinel used in
         # last_loc would wrap around via Python/CUDA negative indexing and
         # corrupt the mask lookup.
-        free_index = free_index[free_index >= 0]
+        free_index = free_index[(free_index >= 0) & (free_index <= self._size_full)]
         if free_index.numel() == 0:
             return
 
@@ -290,12 +294,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.is_not_in_free_group:
             self.full_attn_allocator.free(free_index)
             self.free_swa(free_index)
+            self._assert_allocator_bounds()
         else:
             self.free_group.append(free_index)
 
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
-        self.swa_attn_allocator.free(swa_indices)
+        # Slot 0 is the padded dummy slot for TokenToKVPoolAllocator.
+        # Keep it out of the free list even if stale/corrupted mappings appear.
+        swa_indices = swa_indices[swa_indices > 0]
+        if swa_indices.numel() > 0:
+            self.swa_attn_allocator.free(swa_indices.unique())
         self._allocated_mask[free_index] = False
         # Reset mapping to 0 (valid index for CUDA graph compatibility, won't be used)
         self.full_to_swa_index_mapping[free_index] = 0
@@ -316,6 +325,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # hold a reference to full_to_swa_index_mapping via self._kvcache).
         self._allocated_mask.copy_(state[2])
         self.full_to_swa_index_mapping.copy_(state[3])
+        self._assert_allocator_bounds()
 
     def clear(self):
         self.swa_attn_allocator.clear()
@@ -324,6 +334,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._allocated_mask.fill_(False)
         self.is_not_in_free_group = True
         self.free_group = []
+        self._assert_allocator_bounds()
 
 
 @triton.jit

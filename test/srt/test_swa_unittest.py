@@ -460,6 +460,12 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(alloc.full_available_size(), full_before2 + 1)
         alloc.free(indices2[1:])
 
+        # Out-of-range index filtering should be a no-op
+        full_before_bad = alloc.full_available_size()
+        bad_free = torch.tensor([size + 99], dtype=torch.int64, device="cuda")
+        alloc.free(bad_free)
+        self.assertEqual(alloc.full_available_size(), full_before_bad)
+
         # Free-group batching path
         indices3 = alloc.alloc(4)
         self.assertIsNotNone(indices3)
@@ -471,6 +477,49 @@ class TestSWA(unittest.TestCase):
         alloc.free_group_end()
         self.assertEqual(alloc.full_available_size(), full_before3 + 4)
         self.assertLessEqual(alloc.full_available_size(), size)
+
+        # Invariant: slot 0 should never enter free lists.
+        self.assertTrue(bool(torch.all(alloc.full_attn_allocator.free_pages > 0)))
+        self.assertTrue(bool(torch.all(alloc.swa_attn_allocator.free_pages > 0)))
+
+    def test_swa_long_speculation_stress(self):
+        """Stress backup/restore/free cycles to catch slow allocator drift."""
+        size = 64
+        alloc = self._make_swa_allocator(size=size, size_swa=size)
+
+        steady = alloc.alloc(8)
+        self.assertIsNotNone(steady)
+        full_baseline = alloc.full_available_size()
+        swa_baseline = alloc.swa_available_size()
+
+        for cycle in range(300):
+            state = alloc.backup_state()
+            draft = alloc.alloc(12)
+            self.assertIsNotNone(draft, f"spec alloc failed at cycle {cycle}")
+            alloc.restore_state(state)
+            alloc.free(draft)
+
+            # Batch free path with duplicates every few cycles.
+            if cycle % 10 == 0:
+                tmp = alloc.alloc(4)
+                self.assertIsNotNone(tmp)
+                alloc.free_group_begin()
+                alloc.free(tmp[:2])
+                alloc.free(tmp[:2])
+                alloc.free(tmp[2:])
+                alloc.free_group_end()
+
+            self.assertLessEqual(alloc.full_available_size(), size)
+            self.assertLessEqual(alloc.swa_available_size(), size)
+            self.assertTrue(bool(torch.all(alloc.full_attn_allocator.free_pages > 0)))
+            self.assertTrue(bool(torch.all(alloc.swa_attn_allocator.free_pages > 0)))
+
+        self.assertEqual(alloc.full_available_size(), full_baseline)
+        self.assertEqual(alloc.swa_available_size(), swa_baseline)
+
+        alloc.free(steady)
+        self.assertEqual(alloc.full_available_size(), size)
+        self.assertEqual(alloc.swa_available_size(), size)
 
 
 if __name__ == "__main__":
