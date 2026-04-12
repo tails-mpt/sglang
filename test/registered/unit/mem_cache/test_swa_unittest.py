@@ -553,5 +553,101 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(freed_lens, [4, 1])
 
 
+    def test_swa_backup_restore_eagle3(self):
+        """Test that backup/restore correctly preserves full_to_swa_index_mapping
+        during EAGLE3-style speculation cycles.
+
+        Without the fix, restore_state only restores the sub-allocator free
+        lists but leaves the mapping stale, causing SWA pool drift.
+        """
+        size = 32
+        size_swa = 32
+        head_num = 8
+        head_dim = 128
+        num_layers = 48
+        global_interval = 4
+        dtype = torch.bfloat16
+        device = "cuda"
+        full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
+        full_attention_layer_ids_set = set(full_attention_layer_ids)
+        swa_attention_layer_ids = [
+            i for i in range(num_layers) if i not in full_attention_layer_ids_set
+        ]
+        pool = SWAKVPool(
+            size=size,
+            size_swa=size_swa,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=device,
+        )
+        alloc = SWATokenToKVPoolAllocator(
+            size=size,
+            size_swa=size_swa,
+            dtype=dtype,
+            device=device,
+            kvcache=pool,
+            need_sort=False,
+        )
+
+        # Step 1: Allocate some tokens (simulating a real request in flight)
+        real_indices = alloc.alloc(4)
+        self.assertIsNotNone(real_indices)
+        full_avail_after_real = alloc.full_available_size()
+        swa_avail_after_real = alloc.swa_available_size()
+
+        # Step 2: Backup state (as EAGLE3 does before speculation)
+        saved_state = alloc.backup_state()
+
+        # Snapshot mapping at backup time
+        mapping_at_backup = alloc.full_to_swa_index_mapping.clone()
+
+        # Step 3: Allocate speculative tokens (EAGLE3 draft)
+        spec_indices = alloc.alloc(8)
+        self.assertIsNotNone(spec_indices)
+        self.assertLess(alloc.full_available_size(), full_avail_after_real)
+        self.assertLess(alloc.swa_available_size(), swa_avail_after_real)
+
+        # Step 4: Restore state (undo speculation)
+        alloc.restore_state(saved_state)
+
+        # Step 5: Verify mapping is restored
+        self.assertTrue(
+            torch.equal(alloc.full_to_swa_index_mapping, mapping_at_backup),
+            "full_to_swa_index_mapping not restored after restore_state",
+        )
+
+        # Step 6: Pool sizes should match pre-speculation state
+        self.assertEqual(alloc.full_available_size(), full_avail_after_real)
+        self.assertEqual(alloc.swa_available_size(), swa_avail_after_real)
+
+        # Step 7: Run multiple speculation cycles to detect cumulative drift
+        for cycle in range(20):
+            state = alloc.backup_state()
+            draft = alloc.alloc(8)
+            self.assertIsNotNone(draft, f"alloc failed on cycle {cycle}")
+            alloc.restore_state(state)
+
+        # After 20 cycles, pools must still be the same size (no leak)
+        self.assertEqual(
+            alloc.full_available_size(),
+            full_avail_after_real,
+            f"Full pool drifted after 20 backup/restore cycles",
+        )
+        self.assertEqual(
+            alloc.swa_available_size(),
+            swa_avail_after_real,
+            f"SWA pool drifted after 20 backup/restore cycles",
+        )
+
+        # Step 8: Free the real request — pools should return to initial size
+        alloc.free(real_indices)
+        self.assertEqual(alloc.full_available_size(), size)
+        self.assertEqual(alloc.swa_available_size(), size_swa)
+
+
 if __name__ == "__main__":
     unittest.main()
