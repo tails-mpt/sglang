@@ -265,12 +265,25 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        # Filter invalid/negative indices early — the -1 sentinel used in
+        # last_loc would wrap around via Python/CUDA negative indexing and
+        # corrupt the mask lookup.
+        free_index = free_index[free_index >= 0]
+        if free_index.numel() == 0:
+            return
+
         # Guard against double-free: track allocated state in a separate tensor.
-        # EAGLE3 speculative decoding can call free() on already-freed indices.
+        # EAGLE3 speculative decoding can call free() on already-freed indices
+        # (restore_state returns them to the free list, then verify frees again).
         # We use _allocated_mask (not the mapping itself) to track state, because
         # the mapping must contain valid indices (not -1) for CUDA graph compatibility.
+        # Also deduplicate to handle duplicate indices within a single batched
+        # free call (e.g., from free_group concatenation).
         valid_mask = self._allocated_mask[free_index]
         free_index = free_index[valid_mask]
+        if free_index.numel() == 0:
+            return
+        free_index = free_index.unique()
         if free_index.numel() == 0:
             return
 
@@ -291,12 +304,18 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return [
             self.full_attn_allocator.backup_state(),
             self.swa_attn_allocator.backup_state(),
+            self._allocated_mask.clone(),
+            self.full_to_swa_index_mapping.clone(),
         ]
 
     def restore_state(self, state):
-        assert len(state) == 2
+        assert len(state) == 4
         self.full_attn_allocator.restore_state(state[0])
         self.swa_attn_allocator.restore_state(state[1])
+        # Restore in-place to preserve shared references (attention backends
+        # hold a reference to full_to_swa_index_mapping via self._kvcache).
+        self._allocated_mask.copy_(state[2])
+        self.full_to_swa_index_mapping.copy_(state[3])
 
     def clear(self):
         self.swa_attn_allocator.clear()

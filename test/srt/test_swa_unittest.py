@@ -335,5 +335,143 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(last_node.key.token_ids[1], (60, 70))
 
 
+    def _make_swa_allocator(self, size=32, size_swa=32):
+        """Helper to create a SWAKVPool + SWATokenToKVPoolAllocator pair."""
+        head_num = 8
+        head_dim = 128
+        num_layers = 48
+        global_interval = 4
+        dtype = torch.bfloat16
+        device = "cuda"
+        full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
+        full_attention_layer_ids_set = set(full_attention_layer_ids)
+        swa_attention_layer_ids = [
+            i for i in range(num_layers) if i not in full_attention_layer_ids_set
+        ]
+        pool = SWAKVPool(
+            size=size,
+            size_swa=size_swa,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=device,
+        )
+        alloc = SWATokenToKVPoolAllocator(
+            size=size,
+            size_swa=size_swa,
+            dtype=dtype,
+            device=device,
+            kvcache=pool,
+            need_sort=False,
+        )
+        return alloc
+
+    def test_swa_backup_restore_eagle3(self):
+        """Test that backup/restore correctly preserves _allocated_mask and
+        full_to_swa_index_mapping during EAGLE3-style speculation cycles."""
+        size = 32
+        alloc = self._make_swa_allocator(size=size, size_swa=size)
+
+        real_indices = alloc.alloc(4)
+        self.assertIsNotNone(real_indices)
+        full_avail = alloc.full_available_size()
+        swa_avail = alloc.swa_available_size()
+
+        saved_state = alloc.backup_state()
+        mapping_at_backup = alloc.full_to_swa_index_mapping.clone()
+        mask_at_backup = alloc._allocated_mask.clone()
+
+        spec_indices = alloc.alloc(8)
+        self.assertIsNotNone(spec_indices)
+
+        alloc.restore_state(saved_state)
+
+        self.assertTrue(torch.equal(alloc.full_to_swa_index_mapping, mapping_at_backup))
+        self.assertTrue(torch.equal(alloc._allocated_mask, mask_at_backup))
+        self.assertEqual(alloc.full_available_size(), full_avail)
+        self.assertEqual(alloc.swa_available_size(), swa_avail)
+
+        for cycle in range(20):
+            state = alloc.backup_state()
+            draft = alloc.alloc(8)
+            self.assertIsNotNone(draft, f"alloc failed on cycle {cycle}")
+            alloc.restore_state(state)
+
+        self.assertEqual(alloc.full_available_size(), full_avail)
+        self.assertEqual(alloc.swa_available_size(), swa_avail)
+
+        alloc.free(real_indices)
+        self.assertEqual(alloc.full_available_size(), size)
+        self.assertEqual(alloc.swa_available_size(), size)
+
+    def test_swa_double_free_guard_eagle3(self):
+        """Test that double-free from EAGLE3 restore+free does not corrupt pools."""
+        size = 32
+        alloc = self._make_swa_allocator(size=size, size_swa=size)
+
+        real_indices = alloc.alloc(4)
+        self.assertIsNotNone(real_indices)
+        full_avail = alloc.full_available_size()
+        swa_avail = alloc.swa_available_size()
+
+        for cycle in range(50):
+            state = alloc.backup_state()
+            spec_indices = alloc.alloc(8)
+            self.assertIsNotNone(spec_indices, f"alloc failed on cycle {cycle}")
+            alloc.restore_state(state)
+            # Double-free: free the same spec_indices again (as EAGLE3 verify does)
+            alloc.free(spec_indices)
+
+            self.assertLessEqual(alloc.full_available_size(), size,
+                f"Full pool overflow on cycle {cycle}")
+            self.assertLessEqual(alloc.swa_available_size(), size,
+                f"SWA pool overflow on cycle {cycle}")
+
+        self.assertEqual(alloc.full_available_size(), full_avail)
+        self.assertEqual(alloc.swa_available_size(), swa_avail)
+
+        alloc.free(real_indices)
+        self.assertEqual(alloc.full_available_size(), size)
+        self.assertEqual(alloc.swa_available_size(), size)
+
+    def test_swa_free_edge_cases(self):
+        """Test edge cases: duplicate indices, negative indices, free-group path."""
+        size = 32
+        alloc = self._make_swa_allocator(size=size, size_swa=size)
+
+        # Duplicate indices in single free()
+        indices = alloc.alloc(2)
+        self.assertIsNotNone(indices)
+        full_before = alloc.full_available_size()
+        dup_free = torch.cat([indices, indices[:1]])
+        alloc.free(dup_free)
+        self.assertEqual(alloc.full_available_size(), full_before + 2)
+        self.assertLessEqual(alloc.full_available_size(), size)
+
+        # Negative index filtering
+        indices2 = alloc.alloc(2)
+        self.assertIsNotNone(indices2)
+        full_before2 = alloc.full_available_size()
+        neg_free = torch.tensor([-1, indices2[0].item()], dtype=torch.int64, device="cuda")
+        alloc.free(neg_free)
+        self.assertEqual(alloc.full_available_size(), full_before2 + 1)
+        alloc.free(indices2[1:])
+
+        # Free-group batching path
+        indices3 = alloc.alloc(4)
+        self.assertIsNotNone(indices3)
+        full_before3 = alloc.full_available_size()
+        alloc.free_group_begin()
+        alloc.free(indices3[:2])
+        alloc.free(indices3[:2])  # Double-free in group
+        alloc.free(indices3[2:])
+        alloc.free_group_end()
+        self.assertEqual(alloc.full_available_size(), full_before3 + 4)
+        self.assertLessEqual(alloc.full_available_size(), size)
+
+
 if __name__ == "__main__":
     unittest.main()
