@@ -366,6 +366,18 @@ class Qwen2Model(nn.Module):
                 forward_batch,
                 residual,
             )
+
+        # Capture post-loop (for the output of the final layer).
+        # set_eagle3_layers_to_capture converts layer_ids=[0,14,27] → [1,15,28] (+1 offset
+        # to capture each layer's output as the input to the next layer). For the last layer
+        # (index 27 in a 28-layer model), this maps to index 28 which is self.end_layer and
+        # is not reachable in range(start, end). We handle it here, before normalization, so
+        # that the pre-norm hidden state matches the convention for the other aux states.
+        if self.end_layer in self.layers_to_capture:
+            aux_hidden_states.append(
+                hidden_states + residual if residual is not None else hidden_states
+            )
+
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
