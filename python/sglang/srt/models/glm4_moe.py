@@ -1141,6 +1141,10 @@ class Glm4MoeModel(nn.Module):
                 ].layer_scatter_modes.layer_output_mode,
             )
 
+        # Capture post-loop for the final layer's output (see qwen2.py for explanation).
+        if self.end_layer in self.layers_to_capture:
+            aux_hidden_states.append(hidden_states + residual)
+
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {

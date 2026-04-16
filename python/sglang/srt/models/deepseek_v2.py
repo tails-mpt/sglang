@@ -2117,6 +2117,10 @@ class DeepseekV2Model(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
+        # Capture post-loop for the final layer's output (see qwen2.py for explanation).
+        if self.end_layer in self.layers_to_capture:
+            aux_hidden_states.append(hidden_states + residual if residual is not None else hidden_states)
+
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
