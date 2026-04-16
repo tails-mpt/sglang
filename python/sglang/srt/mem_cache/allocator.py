@@ -517,3 +517,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+
+class SWATokenToKVPoolAllocator(TokenToKVPoolAllocator):
+    """Allocator variant for models with Sliding Window Attention (SWA).
+
+    Extends TokenToKVPoolAllocator with SWA-specific bookkeeping.
+    SpecForge uses isinstance checks against this class to activate
+    SWA-aware memory management for models like Gemma that use SWA.
+    For non-SWA models (e.g. Qwen, Llama), the isinstance check returns
+    False and this class is never instantiated.
+    """
+    pass
