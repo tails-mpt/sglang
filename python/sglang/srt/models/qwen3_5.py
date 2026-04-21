@@ -16,7 +16,7 @@
 
 import logging
 from functools import lru_cache
-from typing import Iterable, Optional, Set, Tuple, Union
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -1387,6 +1387,22 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        # Qwen3_5ForCausalLM.forward captures aux hidden states via the per-layer
+        # `_is_layer_to_capture` attribute, not via the `self.model.layers_to_capture`
+        # list that the inherited Qwen3VL method sets. Without this override the
+        # aux list stays empty, the inner forward returns a plain tensor, and the
+        # VLM wrapper crashes trying to unpack it as (hidden, aux). Propagate the
+        # list to per-layer flags. Parent applies +1 offset when layer_ids given.
+        super().set_eagle3_layers_to_capture(layer_ids)
+        for layer_id in self.model.layers_to_capture:
+            # Parent's +1 offset can push one entry to `end_layer` (one past the
+            # last valid index). Post-loop capture is not wired here, so callers
+            # should pick layer_ids with max <= num_hidden_layers - 2 to avoid
+            # silently dropping the last requested state.
+            if 0 <= layer_id < len(self.model.layers):
+                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1509,6 +1525,22 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        # Qwen3_5ForCausalLM.forward captures aux hidden states via the per-layer
+        # `_is_layer_to_capture` attribute, not via the `self.model.layers_to_capture`
+        # list that the inherited Qwen3VL method sets. Without this override the
+        # aux list stays empty, the inner forward returns a plain tensor, and the
+        # VLM wrapper crashes trying to unpack it as (hidden, aux). Propagate the
+        # list to per-layer flags. Parent applies +1 offset when layer_ids given.
+        super().set_eagle3_layers_to_capture(layer_ids)
+        for layer_id in self.model.layers_to_capture:
+            # Parent's +1 offset can push one entry to `end_layer` (one past the
+            # last valid index). Post-loop capture is not wired here, so callers
+            # should pick layer_ids with max <= num_hidden_layers - 2 to avoid
+            # silently dropping the last requested state.
+            if 0 <= layer_id < len(self.model.layers):
+                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
