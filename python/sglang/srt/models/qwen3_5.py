@@ -1394,6 +1394,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # aux list stays empty, the inner forward returns a plain tensor, and the
         # VLM wrapper crashes trying to unpack it as (hidden, aux). Propagate the
         # list to per-layer flags. Parent applies +1 offset when layer_ids given.
+        #
+        # Clear any previously-set flags before applying the new list. sglang
+        # may call this method twice during server startup — once with None
+        # (default [2, n//2, n-3]) and once with the draft config's layer_ids
+        # — and the flags would otherwise accumulate, producing more aux
+        # captures than the draft's fc layer expects (crash: "mat1 and mat2
+        # shapes cannot be multiplied (M x 5*H and 3*H x H)").
+        for layer in self.model.layers:
+            if hasattr(layer, "_is_layer_to_capture"):
+                layer._is_layer_to_capture = False
         super().set_eagle3_layers_to_capture(layer_ids)
         for layer_id in self.model.layers_to_capture:
             # Parent's +1 offset can push one entry to `end_layer` (one past the
@@ -1533,6 +1543,16 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # aux list stays empty, the inner forward returns a plain tensor, and the
         # VLM wrapper crashes trying to unpack it as (hidden, aux). Propagate the
         # list to per-layer flags. Parent applies +1 offset when layer_ids given.
+        #
+        # Clear any previously-set flags before applying the new list. sglang
+        # may call this method twice during server startup — once with None
+        # (default [2, n//2, n-3]) and once with the draft config's layer_ids
+        # — and the flags would otherwise accumulate, producing more aux
+        # captures than the draft's fc layer expects (crash: "mat1 and mat2
+        # shapes cannot be multiplied (M x 5*H and 3*H x H)").
+        for layer in self.model.layers:
+            if hasattr(layer, "_is_layer_to_capture"):
+                layer._is_layer_to_capture = False
         super().set_eagle3_layers_to_capture(layer_ids)
         for layer_id in self.model.layers_to_capture:
             # Parent's +1 offset can push one entry to `end_layer` (one past the
