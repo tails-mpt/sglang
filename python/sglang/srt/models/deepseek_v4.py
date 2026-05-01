@@ -1039,26 +1039,138 @@ class V4HCBlock(nn.Module):
 
 class V4Gate(nn.Module):
     """MoE gate. Hash routing on first `num_hash_layers=3` layers, score-based
-    elsewhere. V4-specific (V3.2 used score-based throughout).
+    elsewhere. Direct port of V4 reference Gate (inference/model.py lines
+    546-584).
 
-    Hash routing uses a `(vocab_size, num_experts_per_tok)=(129280, 6)` int32
-    lookup table `tid2eid` indexed by the input token id. No softmax / no
-    learned weights for the first 3 layers' routing decisions.
+    Hash routing (first 3 layers, V4-specific): the `tid2eid` lookup table
+    [vocab_size, num_experts_per_tok]=(129280, 6) int32 maps each token id
+    to a fixed set of 6 experts. No softmax, no learned weights for the
+    routing decision (the lookup table is loaded but `requires_grad=False`).
+    The routing weights still come from the score-based path even on hash
+    layers — the `weights = original_scores.gather(1, indices)` step uses
+    the score-based scores; only the `indices` come from the hash table.
 
-    Score-based routing uses sqrtsoftplus scoring + noaux_tc top-k (V3.2
-    inheritance) + routed_scaling_factor=1.5.
-
-    TODO(phase1-port): port from V4 reference inference/model.py:Gate
-    lines 546-584. The score-based path can reuse logic from
-    deepseek_v2.py:DeepseekV2MoE — only the hash branch is new.
+    Score-based routing (layers 3+): sqrtsoftplus(weight @ x) -> +bias ->
+    top-k -> gather original (pre-bias) scores -> normalize -> scale.
+    Matches V3.2's noaux_tc routing semantics.
     """
 
     def __init__(self, layer_id: int, config: PretrainedConfig):
         super().__init__()
         self.layer_id = layer_id
+
+        self.dim = config.hidden_size
+        self.topk = config.num_experts_per_tok
+        # V4 uses scoring_func=sqrtsoftplus; V2/V3 also support softmax/sigmoid.
+        self.score_func = getattr(config, "scoring_func", "sqrtsoftplus")
+        self.route_scale = getattr(config, "routed_scaling_factor", 1.0)
         self.is_hash = layer_id < getattr(config, "num_hash_layers", 0)
-        # TODO(phase1-port): full body
-        raise NotImplementedError("V4Gate scaffold — see TODO(phase1-port)")
+
+        # Routing projection: x [B*T, dim] -> scores [B*T, n_routed_experts].
+        # V4 reference stores this as `weight` directly (not nn.Linear) so the
+        # weight loader can match the checkpoint key naming.
+        self.weight = nn.Parameter(
+            torch.empty(config.n_routed_experts, config.hidden_size)
+        )
+
+        if self.is_hash:
+            # tid2eid: lookup table from token id -> [num_experts_per_tok]
+            # expert ids. Loaded from checkpoint, frozen.
+            self.tid2eid = nn.Parameter(
+                torch.empty(config.vocab_size, self.topk, dtype=torch.int32),
+                requires_grad=False,
+            )
+            self.bias = None
+        else:
+            # Score-bias for expert-selection top-k (does not affect routing
+            # weights themselves; matches V3.2 noaux_tc semantics).
+            self.bias = nn.Parameter(torch.empty(config.n_routed_experts, dtype=torch.float32))
+
+    def forward(
+        self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute routing weights + expert indices for each token.
+
+        Args:
+            x: [B*T, dim] token-flattened hidden state
+            input_ids: [B*T] token ids; required only when `is_hash` is True.
+
+        Returns:
+            (weights, indices):
+                weights: [B*T, topk] routing weights (scaled, normalized)
+                indices: [B*T, topk] expert indices to route to
+        """
+        # Routing projection in fp32 for numerical stability.
+        scores = F.linear(x.float(), self.weight.float())
+        if self.score_func == "softmax":
+            scores = scores.softmax(dim=-1)
+        elif self.score_func == "sigmoid":
+            scores = scores.sigmoid()
+        else:  # sqrtsoftplus (V4 default)
+            scores = F.softplus(scores).sqrt()
+        original_scores = scores
+
+        # Bias shifts scores for top-k selection only (V4 reference line 575).
+        if self.bias is not None:
+            scores = scores + self.bias
+
+        if self.is_hash:
+            assert input_ids is not None, "Hash-routing layers require input_ids"
+            indices = self.tid2eid[input_ids]
+        else:
+            indices = scores.topk(self.topk, dim=-1)[1]
+
+        # Gather pre-bias scores at the selected indices.
+        weights = original_scores.gather(1, indices.long())
+        # Normalize when not softmax (V4 reference line 581-582).
+        if self.score_func != "softmax":
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+        weights = weights * self.route_scale
+        return weights, indices
+
+
+class V4Expert(nn.Module):
+    """Single MoE expert: SwiGLU FFN. Direct port of V4 reference Expert
+    (inference/model.py lines 587-606).
+
+    V4 expert weights are FP4 (`torch.float4_e2m1fn_x2`) with E8M0 scales for
+    routed experts; shared expert is BF16. Computation runs in FP32 inside
+    silu(gate) * up for stability, then casts back to input dtype before w2.
+
+    TODO(phase1-fp4): swap nn.Linear to V4-aware FP4 Linear that handles
+    `torch.float4_e2m1fn_x2` weight storage with E8M0 scales. Until then,
+    we use nn.Linear with bf16 weights and rely on the weight loader to
+    dequantize FP4 -> BF16 on load. That's slow + memory-heavy at runtime
+    but functionally correct for the first integration test.
+    """
+
+    def __init__(
+        self, dim: int, inter_dim: int, swiglu_limit: float = 0.0, dtype=None
+    ):
+        super().__init__()
+        # nn.Linear here; FP4 path is TODO(phase1-fp4).
+        # The reference V4 Linear class accepts `dtype=torch.float4_e2m1fn_x2`
+        # and stores weights in packed FP4. We use bf16 here (the loader
+        # dequantizes on load).
+        self.w1 = nn.Linear(dim, inter_dim, bias=False)
+        self.w2 = nn.Linear(inter_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, inter_dim, bias=False)
+        self.swiglu_limit = swiglu_limit
+
+    def forward(
+        self, x: torch.Tensor, weights: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """SwiGLU expert forward. V4 ref lines 596-606."""
+        dtype = x.dtype
+        gate = self.w1(x).float()
+        up = self.w3(x).float()
+        if self.swiglu_limit > 0:
+            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+            gate = torch.clamp(gate, max=self.swiglu_limit)
+        x = F.silu(gate) * up
+        if weights is not None:
+            x = weights * x
+        return self.w2(x.to(dtype))
 
 
 # ============================================================================
@@ -1069,19 +1181,96 @@ class V4Gate(nn.Module):
 class DeepseekV4MoE(nn.Module):
     """V4 MoE: 256 routed experts top-6 + 1 shared expert.
 
-    Expert weights are FP4 (`torch.float4_e2m1fn_x2`) with FP8 (e8m0fnu) scales,
-    quantized in 32-element blocks. Non-expert weights are FP8 (e4m3fn) with
-    e8m0fnu scales in 128x128 blocks.
+    Direct port of V4 reference MoE (inference/model.py lines 609-644).
 
-    TODO(phase1-port): adapt deepseek_v2.py:DeepseekV2MoE for FP4 expert weight
-    handling. The Gate needs to be the V4Gate above (with hash routing branch).
+    Routing: V4Gate above. Hash routing on first num_hash_layers=3 layers
+    (indices from tid2eid lookup); score-based routing on the rest
+    (sqrtsoftplus + topk).
+
+    Expert weights: FP4 (`torch.float4_e2m1fn_x2`) with FP8 (e8m0fnu) scales,
+    quantized in 32-element blocks along K (reduce dim). Shared expert is
+    BF16 / FP8 (matching the rest of the model's non-expert quantization).
+
+    TP behavior: V4 reference shards experts across world_size. With
+    world_size=1 this is pass-through. TODO(phase1-tp): apply
+    expert-parallel sharding when integrated into sglang's TP runtime.
     """
 
     def __init__(self, layer_id: int, config: PretrainedConfig):
         super().__init__()
         self.layer_id = layer_id
-        # TODO(phase1-port): full body
-        raise NotImplementedError("DeepseekV4MoE scaffold — see TODO(phase1-port)")
+        self.dim = config.hidden_size
+
+        # TP-aware: with world_size=1, all experts are local.
+        self.n_routed_experts = config.n_routed_experts
+        self.n_local_experts = config.n_routed_experts  # TODO(phase1-tp): // world_size
+        self.n_activated_experts = config.num_experts_per_tok
+        self.experts_start_idx = 0  # TODO(phase1-tp): rank * n_local_experts
+        self.experts_end_idx = self.n_local_experts
+        n_shared_experts = getattr(config, "n_shared_experts", 1)
+        assert n_shared_experts == 1, (
+            f"V4 expects exactly 1 shared expert per layer; config has {n_shared_experts}"
+        )
+
+        # Routing gate (hash-or-score per layer_id < num_hash_layers).
+        self.gate = V4Gate(layer_id, config)
+
+        # Routed experts. V4 reference stores None for non-local-rank experts
+        # to save memory; with world_size=1 this is just a list of all experts.
+        # TODO(phase1-fp4): wire FP4 expert dtype handling. For now bf16 storage.
+        moe_inter_dim = config.moe_intermediate_size
+        swiglu_limit = getattr(config, "swiglu_limit", 0.0)
+        self.experts = nn.ModuleList(
+            [
+                V4Expert(self.dim, moe_inter_dim, swiglu_limit=swiglu_limit)
+                if self.experts_start_idx <= i < self.experts_end_idx
+                else None
+                for i in range(self.n_routed_experts)
+            ]
+        )
+
+        # Shared expert (always-on, every token).
+        self.shared_experts = V4Expert(self.dim, moe_inter_dim, swiglu_limit=swiglu_limit)
+
+    def forward(
+        self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """V4 MoE forward. Direct port of V4 reference MoE.forward (lines 629-644).
+
+        Args:
+            x: [B, T, dim] hidden state
+            input_ids: [B, T] token ids (required for hash-routing layers)
+
+        Returns:
+            y: [B, T, dim] MoE output (sum of routed experts + shared expert)
+        """
+        shape = x.size()
+        x_flat = x.view(-1, self.dim)
+        flat_input_ids = input_ids.flatten() if input_ids is not None else None
+        weights, indices = self.gate(x_flat, flat_input_ids)
+
+        # Accumulate routed expert outputs.
+        y = torch.zeros_like(x_flat, dtype=torch.float32)
+
+        # V4 reference uses bincount + per-expert iteration. This is fine for
+        # bf16 inference; sglang has a fused MoE path for higher throughput
+        # we'll wire later (TODO(phase1-fused-moe)).
+        counts = torch.bincount(
+            indices.flatten().long(), minlength=self.n_routed_experts
+        ).tolist()
+        for i in range(self.experts_start_idx, self.experts_end_idx):
+            if counts[i] == 0:
+                continue
+            expert = self.experts[i]
+            idx, top = torch.where(indices == i)
+            y[idx] = y[idx] + expert(x_flat[idx], weights[idx, top, None])
+
+        # TP all_reduce stub (world_size=1 -> noop). TODO(phase1-tp).
+        # if world_size > 1: dist.all_reduce(y)
+
+        # Shared expert: always-on; runs on every token.
+        y = y + self.shared_experts(x_flat)
+        return y.type_as(x).view(shape)
 
 
 # ============================================================================
