@@ -301,22 +301,112 @@ def sparse_attn_v4(
     topk_idxs: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
-    """Sparse attention kernel for V4 CSA + HCA layers.
+    """Sparse attention with per-head attn_sink. Python reference impl.
 
-    TODO(phase1-kernel): wire to sglang's NSA tilelang kernel
-    (sglang/srt/layers/attention/nsa/tilelang_kernel.py). The V3.2 NSA path
-    uses the same shape contract: Q [b, s, h, d], KV [b, k, d] with single
-    shared K/V head (MQA), topk_idxs [b, s, k_per_query] selecting from KV
-    along the k axis, attn_sink [h] adding a per-head sink-token
-    contribution, softmax_scale = head_dim ** -0.5.
+    Direct port of V4 reference inference/kernel.py:sparse_attn_kernel
+    (lines 277-352). Computes attention only over the topk-selected KV
+    positions per query, with a learnable per-head sink-token bias that
+    contributes to the softmax denominator without contributing to the
+    value-weighted output sum.
 
-    Until wired, this raises so any actual forward call is caught loudly
-    instead of silently returning garbage.
+    Args:
+        q: [B, S, H, D] queries (BF16 or FP32)
+        kv: [B, K, D] keys+values for the layer's KV cache (single shared
+            K/V head — MQA). For prefill, K = window_size + maybe_compressed.
+            For decode, K = full kv_cache size; topk_idxs masks to active.
+        attn_sink: [H] per-head learnable sink-token bias (FP32)
+        topk_idxs: [B, S, K_per_q] int (or int32) indices into KV. Values
+            of -1 indicate "no valid position" (padding) and are masked.
+        softmax_scale: typically `1 / sqrt(D)` (V4 stores `head_dim ** -0.5`)
+
+    Returns:
+        out: [B, S, H, D] attention output
+
+    NOTE on kernel wiring (architecture-notes.md "Open risks #11"):
+        sglang's NSA tilelang kernels at sglang/srt/layers/attention/nsa/
+        tilelang_kernel.py (`sparse_attention_fwd_kernel_v1` /
+        `sparse_attention_fwd_kernel_v2`) implement the same sparse-topk
+        pattern but DO NOT support attn_sink. Two paths to integrate:
+
+          1. **Extend NSA kernel** (sgl-kernel work): add an optional
+             `attn_sink: T.Tensor[(num_heads,), FP32]` argument and apply
+             the V4 reference's `sum_exp[i] += T.exp(attn_sink[i] -
+             scores_max[i])` mass-addition step in the softmax denominator.
+             This is the right long-term path.
+
+          2. **Python sink + NSA value path** (engineering shortcut): call
+             NSA's existing kernel for the value-weighted sum, then
+             post-multiply by a sink-correction factor:
+                 sink_correction = sum_exp / (sum_exp + sum_sink_exp)
+                 out = NSA_out * sink_correction.unsqueeze(-1)
+             The sum_exp is internal to NSA so this needs an NSA API
+             tweak too (return sum_exp + scores_max). Mid-term path.
+
+          3. **Pure Python reference** (this function): correct but slow.
+             Used for laptop-side numerical validation against the V4 HF
+             reference impl. Replace with path 1 or 2 for production.
+
+        For Phase 4 smoke test we accept the slow reference because the
+        smoke is 30 steps on 1k samples — not perf-critical. Phase 5+
+        require kernel wiring.
+
+    TODO(phase1-kernel): replace with NSA-kernel + attn_sink extension.
     """
-    raise NotImplementedError(
-        "sparse_attn_v4: wire to sglang/srt/layers/attention/nsa/tilelang_kernel.py "
-        "(see TODO(phase1-kernel))."
+    bsz, seqlen, n_heads, head_dim = q.shape
+    K_per_q = topk_idxs.shape[-1]
+    kv_len = kv.shape[1]
+
+    # Mask invalid positions BEFORE clamping for safe gather. Save the mask.
+    valid_mask = topk_idxs >= 0  # [B, S, K_per_q]
+
+    # Clamp negatives to 0 so torch.gather doesn't error; we'll mask scores below.
+    safe_idxs = topk_idxs.clamp(min=0).long()
+
+    # Gather selected KV per query.
+    # selected_kv: [B, S, K_per_q, D]
+    # Expand kv from [B, kv_len, D] to [B, S, kv_len, D] then gather along dim 2.
+    kv_expanded = kv.unsqueeze(1).expand(bsz, seqlen, kv_len, head_dim)
+    gather_idx = safe_idxs.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+    selected_kv = torch.gather(kv_expanded, 2, gather_idx)  # [B, S, K_per_q, D]
+
+    # Compute scaled scores.
+    # q: [B, S, H, D], selected_kv: [B, S, K_per_q, D]
+    # scores: [B, S, H, K_per_q]
+    scores = torch.einsum("bshd,bskd->bshk", q.float(), selected_kv.float()) * softmax_scale
+
+    # Mask invalid positions to -inf BEFORE the softmax so they contribute zero
+    # weight (and zero to sum_exp).
+    scores = scores.masked_fill(~valid_mask.unsqueeze(2), float("-inf"))
+
+    # Numerically-stable softmax with attn_sink in the denominator only.
+    # The V4 reference kernel does:
+    #   scores_max = max(scores, dim=K_per_q)
+    #   sum_exp = sum(exp(scores - scores_max), dim=K_per_q)
+    #               + exp(attn_sink - scores_max)            # sink contribution
+    #   weights = exp(scores - scores_max) / sum_exp
+    # Matches V4 ref kernel.py lines 340-347.
+    scores_max = scores.amax(dim=-1, keepdim=True)
+    # If a row had ALL -inf scores (no valid positions for this query),
+    # scores_max is -inf and exp(-inf - -inf) is NaN. Replace with 0
+    # — output for that row will be zeros via the value-mix below.
+    safe_scores_max = torch.where(
+        torch.isinf(scores_max), torch.zeros_like(scores_max), scores_max
     )
+    exp_scores = torch.exp(scores - safe_scores_max)  # [B, S, H, K_per_q]
+    # Zero out the -inf rows' contributions cleanly.
+    exp_scores = exp_scores.masked_fill(~valid_mask.unsqueeze(2), 0.0)
+    sum_exp = exp_scores.sum(dim=-1, keepdim=True)
+    # Sink contribution: exp(attn_sink[h] - scores_max[b,s,h,1])
+    sink_term = torch.exp(
+        attn_sink.float().view(1, 1, n_heads, 1) - safe_scores_max
+    )
+    sum_exp_with_sink = sum_exp + sink_term
+    weights = exp_scores / sum_exp_with_sink.clamp(min=torch.finfo(exp_scores.dtype).eps)
+
+    # Output: weighted sum of selected_kv (sink slot has v=0 by construction).
+    # weights: [B, S, H, K_per_q], selected_kv: [B, S, K_per_q, D]
+    out = torch.einsum("bshk,bskd->bshd", weights, selected_kv.float())
+    return out.to(q.dtype)
 
 
 # ============================================================================
@@ -838,15 +928,25 @@ class V4Attention(nn.Module):
         if self.compress_ratio:
             offset = kv.size(1) if start_pos == 0 else win
             if self.indexer is not None:
-                # CSA path: learned-index topk via the Indexer.
-                # TODO(phase1-nsa): self.indexer(x, qr, start_pos, offset)
-                raise NotImplementedError(
-                    "V4Attention CSA path: Indexer not yet wired (TODO(phase1-nsa))."
-                )
+                # CSA path with learned-index Indexer (V4 reference line 511).
+                # TODO(phase1-nsa): wire to sglang.srt.layers.attention.nsa
+                # .nsa_indexer.Indexer once the V4-specific config (compress_ratio
+                # = 4, dual rope_theta) is plumbed through. Until then,
+                # self.indexer is None even on CSA layers and we fall through
+                # to the deterministic-stride branch below — which is HCA's
+                # behavior, applied as a best-effort approximation on CSA layers.
+                # CSA quality will be off vs the V4 reference until the Indexer
+                # lands; flagged in architecture-notes.md "Open risks #11".
+                compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
             else:
-                # HCA path: deterministic stride topk.
-                compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset)
-                topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+                # No-Indexer path. Used by HCA layers (compress_ratio==128) and
+                # ALSO by CSA layers as a best-effort fallback until
+                # TODO(phase1-nsa) lands. get_compress_topk_idxs gives
+                # deterministic stride selection over the compressed KV.
+                compress_topk_idxs = get_compress_topk_idxs(
+                    ratio, bsz, seqlen, start_pos, offset
+                )
+            topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
         topk_idxs = topk_idxs.int()
 
         # ---- Compress KV + sparse attention ----

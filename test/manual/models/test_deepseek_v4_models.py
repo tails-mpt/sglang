@@ -311,9 +311,73 @@ def test_layer_attention_type_dispatch_full_pattern():
         assert types[i] == V4LayerAttentionType.HCA, f"layer {i} should be HCA but is {types[i]}"
 
 
-@pytest.mark.skip(reason="Requires sparse_attn_v4 wired to NSA tilelang kernel (TODO(phase1-kernel))")
+def test_sparse_attn_v4_basic_shape():
+    """sparse_attn_v4 produces the expected output shape and respects the
+    -1 (invalid) entries in topk_idxs."""
+    import torch
+    from sglang.srt.models.deepseek_v4 import sparse_attn_v4
+
+    bsz, seqlen, n_heads, head_dim = 2, 8, 4, 64
+    kv_len, K_per_q = 16, 4
+
+    torch.manual_seed(0)
+    q = torch.randn(bsz, seqlen, n_heads, head_dim)
+    kv = torch.randn(bsz, kv_len, head_dim)
+    attn_sink = torch.randn(n_heads)
+    # All valid indices in [0, kv_len)
+    topk_idxs = torch.randint(0, kv_len, (bsz, seqlen, K_per_q)).int()
+    softmax_scale = head_dim ** -0.5
+
+    out = sparse_attn_v4(q, kv, attn_sink, topk_idxs, softmax_scale)
+    assert out.shape == (bsz, seqlen, n_heads, head_dim)
+    assert not torch.isnan(out).any(), "output contains NaN"
+    assert not torch.isinf(out).any(), "output contains Inf"
+
+
+def test_sparse_attn_v4_invalid_indices_zero_contribution():
+    """When topk_idxs contains -1 entries, those positions must contribute
+    zero to the output (V4 reference behavior; matches the V4 kernel's
+    masking)."""
+    import torch
+    from sglang.srt.models.deepseek_v4 import sparse_attn_v4
+
+    bsz, seqlen, n_heads, head_dim = 1, 2, 2, 32
+    kv_len, K_per_q = 8, 4
+
+    torch.manual_seed(1)
+    q = torch.randn(bsz, seqlen, n_heads, head_dim)
+    kv = torch.randn(bsz, kv_len, head_dim)
+    attn_sink = torch.zeros(n_heads)  # disable sink for cleaner check
+    softmax_scale = head_dim ** -0.5
+
+    # Case A: only valid index 0 per query (rest are -1)
+    idxs_a = torch.full((bsz, seqlen, K_per_q), -1, dtype=torch.int32)
+    idxs_a[..., 0] = 0
+    # Case B: ALL -1 (no valid positions). With attn_sink=0, output should be
+    # zeros (degenerate softmax mass goes entirely to the sink, which has v=0).
+    idxs_b = torch.full((bsz, seqlen, K_per_q), -1, dtype=torch.int32)
+
+    out_a = sparse_attn_v4(q, kv, attn_sink, idxs_a, softmax_scale)
+    out_b = sparse_attn_v4(q, kv, attn_sink, idxs_b, softmax_scale)
+
+    # When only kv[0] is valid, output should equal kv[0] for every query
+    # (softmax weight is 1 on the single valid position; sink=0 contributes
+    # to denominator but the only-valid softmax weight stays > 0).
+    assert torch.allclose(
+        out_a[0, 0, 0], kv[0, 0], atol=1e-5
+    ), "single-valid-idx output should equal that kv"
+
+    # When NO indices valid, the output is dominated by the sink and the
+    # values are zero except for floating-point noise.
+    assert torch.allclose(out_b, torch.zeros_like(out_b), atol=1e-5), (
+        "all-invalid-idx output should be zero (sink absorbs all mass)"
+    )
+
+
+@pytest.mark.skip(reason="Requires DeepseekV4ForCausalLM full trunk + load_weights")
 def test_v4attention_forward_shape():
-    """V4Attention forward shape test — turned on when sparse_attn_v4 lands."""
+    """V4Attention forward shape test — needs full config + initialized
+    parameters; turned on once load_weights ports a real checkpoint."""
     pass
 
 
