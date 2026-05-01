@@ -2206,6 +2206,15 @@ def _remap_one_v4_key(key: str) -> str:
     if key == "head.weight":
         return "lm_head.weight"
 
+    # 1b. Top-level final RMSNorm: V4 ckpt has `norm.weight` (RMSNorm submodule
+    # at the Transformer level, V4 ref line 787). Our model uses
+    # `self.final_norm_weight` Parameter. Without an explicit remap, this would
+    # pass through and load_state_dict would mark it "unexpected" — drop a real
+    # tensor on the floor. Discovered 2026-04-30 23:24 Phoenix during the V4
+    # safetensors index audit.
+    if key == "norm.weight":
+        return "final_norm_weight"
+
     # 2. mHC flat params -> .hc submodule.
     # Pattern: layers.<i>.hc_<x>_<y>  (or mtp.<i>.hc_<x>_<y>)
     for suffix in _V4_MHC_SUFFIXES:
@@ -2228,12 +2237,20 @@ def _remap_one_v4_key(key: str) -> str:
             prefix = key[: -len(token)]
             return f"{prefix}.{norm}_weight"
 
-    # Special case: compressor.norm.weight (deeper path than the simple
-    # "<prefix>.<norm>.weight" pattern would catch — the norm is INSIDE
-    # the compressor submodule).
+    # 3b. Special case: `<prefix>.compressor.norm.weight` (deeper path than the
+    # simple "<prefix>.<norm>.weight" pattern would catch — the norm is INSIDE
+    # the compressor submodule). Similarly for `<prefix>.norm.weight` where
+    # `<prefix>` is `mtp.<i>` (MTPBlock final RMSNorm).
     if key.endswith(".compressor.norm.weight"):
         prefix = key[: -len(".compressor.norm.weight")]
         return f"{prefix}.compressor.norm_weight"
+    if key.endswith(".norm.weight"):
+        # Catches mtp.<i>.norm.weight specifically. Anything else ending in
+        # ".norm.weight" that's NOT under mtp.<i>. and NOT under compressor.
+        # is unexpected, but we still apply the rename for completeness; the
+        # load_state_dict pass will flag truly-unexpected keys.
+        prefix = key[: -len(".norm.weight")]
+        return f"{prefix}.norm_weight"
 
     # 4. Pass through unchanged.
     return key

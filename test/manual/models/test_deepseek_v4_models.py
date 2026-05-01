@@ -527,6 +527,42 @@ def test_remap_mhc_to_submodule():
                 assert new in sd_out, f"new key {new} missing"
 
 
+def test_remap_top_level_final_norm():
+    """Top-level `norm.weight` (V4 trunk final RMSNorm) -> `final_norm_weight`.
+    Discovered 2026-04-30 during V4 safetensors index audit; without this
+    remap the trunk final norm tensor would be silently dropped at
+    load_state_dict time."""
+    import torch
+    from sglang.srt.models.deepseek_v4 import _remap_v4_checkpoint_keys
+
+    sd_in = {
+        "norm.weight": torch.zeros(4096),
+        "embed.weight": torch.zeros(129280, 4096),
+        "head.weight": torch.zeros(129280, 4096),
+    }
+    cfg = _make_full_v4_config()
+    sd_out = _remap_v4_checkpoint_keys(sd_in, cfg)
+    assert "norm.weight" not in sd_out
+    assert "final_norm_weight" in sd_out
+    # head.weight still renames to lm_head.weight in the same call
+    assert "lm_head.weight" in sd_out
+    # embed.weight passes through
+    assert "embed.weight" in sd_out
+
+
+def test_remap_mtp_final_norm():
+    """`mtp.<i>.norm.weight` (MTPBlock final RMSNorm) -> `mtp.<i>.norm_weight`.
+    Same remap class as the per-layer norms but with the bare `norm` name."""
+    import torch
+    from sglang.srt.models.deepseek_v4 import _remap_v4_checkpoint_keys
+
+    sd_in = {"mtp.0.norm.weight": torch.zeros(4096)}
+    cfg = _make_full_v4_config()
+    sd_out = _remap_v4_checkpoint_keys(sd_in, cfg)
+    assert "mtp.0.norm.weight" not in sd_out
+    assert "mtp.0.norm_weight" in sd_out
+
+
 def test_split_mtp_keys():
     """_split_v4_mtp_keys partitions a state_dict into (main_dict, mtp_dict)
     based on the `mtp.` prefix per CLAUDE.md rule #12 (MTP loaded but not run).
