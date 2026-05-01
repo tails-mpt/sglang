@@ -772,4 +772,130 @@ def test_remap_pass_through_for_unrenamed_keys():
         assert f"layers.{i}.ffn.gate.weight" in sd_out
         assert f"layers.{i}.ffn.experts.0.w1.weight" in sd_out
         assert f"layers.{i}.ffn.shared_experts.w2.weight" in sd_out
+
+
+# ============================================================================
+# Phase 3 dequant helpers — synthetic FP8/FP4 round-trip tests
+# ============================================================================
+#
+# These tests exercise the dequant-on-load pipeline (path b in load_weights
+# docstring) using synthetic tensors that don't require a real V4 checkpoint
+# or 159GB of FP4 expert weights. Run on CPU; torch's float8_e4m3fn and
+# packed-uint8 FP4 representations don't need GPU.
+
+
+def test_e8m0_to_float_uint8():
+    """e8m0fnu encoded as uint8 -> float multiplier = 2^(byte - 127)."""
+    import torch
+    from sglang.srt.models.deepseek_v4 import _e8m0_to_float
+
+    # byte 127 = 2^0 = 1.0; byte 128 = 2^1 = 2.0; byte 126 = 2^-1 = 0.5
+    bytes_in = torch.tensor([126, 127, 128, 130], dtype=torch.uint8)
+    out = _e8m0_to_float(bytes_in)
+    assert out.dtype == torch.float32
+    expected = torch.tensor([0.5, 1.0, 2.0, 8.0])
+    assert torch.allclose(out, expected, atol=1e-6)
+
+
+def test_scale_to_e8m0_bytes_roundtrip():
+    """Round-trip uint8 e8m0 -> float -> uint8 e8m0 preserves values."""
+    import torch
+    from sglang.srt.models.deepseek_v4 import _e8m0_to_float, _scale_to_e8m0_bytes
+
+    bytes_in = torch.tensor([100, 127, 130, 200], dtype=torch.uint8)
+    f = _e8m0_to_float(bytes_in)
+    bytes_back = _scale_to_e8m0_bytes(f)
+    assert torch.equal(bytes_in, bytes_back)
+
+
+def test_classify_v4_weight_scale_pair_fp8():
+    """Native FP8 e4m3fn weight is classified 'fp8' regardless of scale shape."""
+    import torch
+    from sglang.srt.models.deepseek_v4 import _classify_v4_weight_scale_pair
+
+    # FP8 e4m3fn weight, e8m0 scale at 128:1 ratio in both dims
+    weight = torch.zeros((512, 1024), dtype=torch.float8_e4m3fn)
+    scale = torch.zeros((4, 8), dtype=torch.uint8)  # 512/128=4, 1024/128=8
+    assert _classify_v4_weight_scale_pair(weight, scale) == "fp8"
+
+
+def test_classify_v4_weight_scale_pair_fp4_uint8_legacy():
+    """Legacy uint8-packed FP4 weight discriminated by scale-shape ratio."""
+    import torch
+    from sglang.srt.models.deepseek_v4 import _classify_v4_weight_scale_pair
+
+    # FP4 packed: weight (out=64, in_packed=512/2=256), scale (64, 512/32=16)
+    weight = torch.zeros((64, 256), dtype=torch.uint8)
+    scale = torch.zeros((64, 16), dtype=torch.uint8)
+    assert _classify_v4_weight_scale_pair(weight, scale) == "fp4"
+
+
+def test_dequant_fp8_blockwise_synthetic():
+    """FP8 e4m3fn weight + e8m0 scale dequant matches manual computation."""
+    import torch
+    from sglang.srt.models.deepseek_v4 import _dequant_fp8_blockwise
+
+    # 128x128 FP8 weight, single 1x1 scale block
+    weight_bf = torch.randn(128, 128, dtype=torch.bfloat16) * 0.5
+    weight_fp8 = weight_bf.to(torch.float8_e4m3fn)
+    # Scale byte 127 = 1.0x multiplier
+    scale = torch.tensor([[127]], dtype=torch.uint8)
+
+    out = _dequant_fp8_blockwise(weight_fp8, scale, target_dtype=torch.bfloat16)
+    assert out.dtype == torch.bfloat16
+    assert out.shape == (128, 128)
+    # Cast through FP8 then back to BF16 introduces some error, but close.
+    expected = weight_fp8.to(torch.float32).to(torch.bfloat16)
+    assert torch.allclose(out, expected, atol=0.01, rtol=0.05)
+
+
+def test_dequant_mxfp4_synthetic_zeros():
+    """All-zero packed FP4 weight + any scale dequants to all zeros."""
+    import torch
+    from sglang.srt.models.deepseek_v4 import _dequant_mxfp4
+
+    # Packed uint8: 64 logical FP4 values per row -> 32 packed bytes
+    # Block size 32 along K -> 64 logical / 32 = 2 scale columns
+    weight = torch.zeros((4, 32), dtype=torch.uint8)
+    scale = torch.full((4, 2), 127, dtype=torch.uint8)  # scale=1.0
+    out = _dequant_mxfp4(weight, scale, target_dtype=torch.bfloat16)
+    assert out.dtype == torch.bfloat16
+    assert out.shape == (4, 64)  # 32 packed -> 64 logical
+    assert torch.all(out == 0)
+
+
+def test_dequantize_v4_fp8_fp4_e2e_synthetic():
+    """End-to-end: synthetic state_dict with FP8 + FP4 weight/scale pairs +
+    a non-quantized passthrough key. Verify counts + shapes."""
+    import torch
+    from sglang.srt.models.deepseek_v4 import _dequantize_v4_fp8_fp4
+
+    state_dict = {
+        # FP8 attn linear: (256, 512) weight, (2, 4) scale
+        "layers.0.attn.wq_a.weight": torch.zeros((256, 512), dtype=torch.float8_e4m3fn),
+        "layers.0.attn.wq_a.scale": torch.full((2, 4), 127, dtype=torch.uint8),
+        # FP4 expert: (32, 128) packed -> logical (32, 256), scale (32, 8)
+        "layers.0.ffn.experts.0.w1.weight": torch.zeros((32, 128), dtype=torch.uint8),
+        "layers.0.ffn.experts.0.w1.scale": torch.full((32, 8), 127, dtype=torch.uint8),
+        # Pure BF16 (e.g. norm) - no scale partner
+        "layers.0.attn_norm_weight": torch.ones(4096, dtype=torch.bfloat16),
+        # Embedding (no scale partner)
+        "embed.weight": torch.randn((1000, 4096), dtype=torch.bfloat16),
+    }
+
+    out, n_fp8, n_fp4 = _dequantize_v4_fp8_fp4(state_dict, target_dtype=torch.bfloat16)
+
+    assert n_fp8 == 1
+    assert n_fp4 == 1
+    # Scales should be dropped, weights replaced with BF16
+    assert "layers.0.attn.wq_a.scale" not in out
+    assert "layers.0.ffn.experts.0.w1.scale" not in out
+    assert out["layers.0.attn.wq_a.weight"].dtype == torch.bfloat16
+    assert out["layers.0.attn.wq_a.weight"].shape == (256, 512)
+    assert out["layers.0.ffn.experts.0.w1.weight"].dtype == torch.bfloat16
+    assert out["layers.0.ffn.experts.0.w1.weight"].shape == (32, 256)  # logical K
+    # Pass-through keys unchanged
+    assert "layers.0.attn_norm_weight" in out
+    assert "embed.weight" in out
+    assert out["layers.0.attn_norm_weight"].shape == (4096,)
         assert f"layers.{i}.attn.wq_a.weight" in sd_out
