@@ -127,15 +127,37 @@ class V4LayerAttentionType:
 class V4Compressor(nn.Module):
     """V4 KV-compression module.
 
-    TODO(phase1-port): port from /tmp/v4-flash-meta/inference/model.py:Compressor
-    Lines 279-377 of the V4 reference impl. The implementation has two
-    complications:
-      1. compress_ratio=4 uses `overlap=True` with overlap_transform; ratio=128
-         uses non-overlapping aggregation.
-      2. Decode-phase (start_pos > 0) uses incremental state buffers
-         (kv_state, score_state) updated per-token until a compression
-         boundary is hit.
-    Numerical agreement with the V4 reference is the unit-test bar.
+    Ported 2026-04-30 from /tmp/v4-flash-meta/inference/model.py:Compressor
+    (lines 279-377 of the V4 reference). Compresses KV cache via learned
+    gated pooling over `compress_ratio` consecutive tokens.
+
+    Two modes (per V4's per-layer attention dispatch):
+      - `compress_ratio == 4` -> `overlap=True`. Two parallel compressions
+        per chunk (offset by `ratio`) for smoother boundaries; uses
+        `overlap_transform` to interleave.
+      - `compress_ratio == 128` -> `overlap=False`. Standard non-overlap
+        chunked compression.
+
+    Decode-phase (start_pos > 0) uses incremental state buffers (`kv_state`,
+    `score_state`) that accumulate per-token until a compression boundary
+    fires (every `ratio` decode steps).
+
+    Differences from the V4 reference impl, with TODO markers:
+      - V4 reference uses parallel `Linear` (its own TP-aware class). We
+        use `nn.Linear` here; TP-aware refactor at integration time.
+        TODO(phase1-tp): swap wkv/wgate to `ColumnParallelLinear` once the
+        TP layout is decided per architecture-notes.md.
+      - V4 reference applies `apply_rotary_emb(kv[..., -rd:], freqs_cis)`
+        in-place. We delegate to a `rotary_apply_fn` callable passed by
+        the parent Attention layer (CSAAttention / HCAAttention). The
+        sglang rotary embedding module owns the freqs_cis lifetime.
+      - V4 reference applies `act_quant` / `fp4_act_quant` / `rotate_activation`
+        for QAT simulation. These are TODO markers for the
+        sgl-kernel quant path. For initial integration we run pure
+        FP32/BF16; QAT-equivalent simulation lands in a follow-up.
+        TODO(phase1-quant): wire sglang FP8 act_quant from
+        sglang.srt.layers.quantization.fp8_kernel; add fp4_act_quant +
+        Hadamard rotation kernels to sgl-kernel/csrc/.
     """
 
     def __init__(
@@ -145,11 +167,221 @@ class V4Compressor(nn.Module):
         compress_ratio: int,
         rope_head_dim: int,
         max_batch_size: int,
+        norm_eps: float = 1e-6,
         rotate: bool = False,
     ):
         super().__init__()
-        # TODO(phase1-port): full body
-        raise NotImplementedError("V4Compressor scaffold — see TODO(phase1-port)")
+        self.dim = hidden_size
+        self.head_dim = head_dim
+        self.rope_head_dim = rope_head_dim
+        self.nope_head_dim = head_dim - rope_head_dim
+        self.compress_ratio = compress_ratio
+        self.overlap = compress_ratio == 4
+        self.rotate = rotate
+        coff = 1 + int(self.overlap)
+
+        # Learned compression parameters. ape = additive positional embedding
+        # scoped to the compress window (per V4 reference line 294).
+        self.ape = nn.Parameter(
+            torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32)
+        )
+        # wkv / wgate stored in fp32 here for numerical convenience; the V4
+        # checkpoint stores them in bf16 (V4 reference line 295-298). The
+        # weight loader must up-cast on load.
+        self.wkv = nn.Linear(self.dim, coff * self.head_dim, bias=False, dtype=torch.float32)
+        self.wgate = nn.Linear(self.dim, coff * self.head_dim, bias=False, dtype=torch.float32)
+
+        # RMSNorm shim. Use sglang's layernorm module so the kernel matches
+        # the rest of the sglang attention path.
+        # TODO(phase1-norm): import lazily to avoid circular import; for now
+        # use a thin functional implementation (matches V4 reference's RMSNorm
+        # exactly: x.float().square().mean(-1).rsqrt() * weight).
+        self.norm_weight = nn.Parameter(torch.ones(self.head_dim, dtype=torch.float32))
+        self.norm_eps = norm_eps
+
+        # Buffers wired by the parent Attention's __init__:
+        #   kv_cache: the compressed-KV section of the parent's KV cache buffer.
+        #   freqs_cis: the rotary frequencies (compress_rope_theta=160000 path).
+        # Both are set lazily; see assertions in forward().
+        self.kv_cache: Optional[torch.Tensor] = None
+        self.freqs_cis: Optional[torch.Tensor] = None
+
+        # Decode-phase incremental state. With overlap: state[:, :ratio] is the
+        # overlapping window, state[:, ratio:] the current window.
+        self.register_buffer(
+            "kv_state",
+            torch.zeros(
+                max_batch_size,
+                coff * compress_ratio,
+                coff * self.head_dim,
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "score_state",
+            torch.full(
+                (max_batch_size, coff * compress_ratio, coff * self.head_dim),
+                float("-inf"),
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+
+    # -----------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------
+
+    def _rmsnorm(self, x: torch.Tensor) -> torch.Tensor:
+        """Functional RMSNorm matching V4 reference exactly.
+        TODO(phase1-norm): replace with sglang.srt.layers.layernorm.RMSNorm
+        for kernel parity once sglang's RMSNorm accepts an external weight
+        Parameter (current API constructs its own).
+        """
+        dtype = x.dtype
+        x32 = x.float()
+        var = x32.square().mean(-1, keepdim=True)
+        x32 = x32 * torch.rsqrt(var + self.norm_eps)
+        return (self.norm_weight * x32).to(dtype)
+
+    def overlap_transform(self, tensor: torch.Tensor, value: float = 0):
+        """Overlap-mode reshape. Input [b, s, ratio, 2d] -> [b, s, 2*ratio, d].
+        First ratio rows = previous chunk's overlap window, last ratio rows =
+        current chunk. V4 reference lines 307-314."""
+        b, s, _, _ = tensor.size()
+        ratio, d = self.compress_ratio, self.head_dim
+        new_tensor = tensor.new_full((b, s, 2 * ratio, d), value)
+        new_tensor[:, :, ratio:] = tensor[:, :, :, d:]
+        new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
+        return new_tensor
+
+    # -----------------------------------------------------------------
+    # forward
+    # -----------------------------------------------------------------
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        rotary_apply_fn: Optional[Any] = None,
+    ) -> Optional[torch.Tensor]:
+        """Compress the KV stream up to position start_pos+seqlen.
+
+        Args:
+            x: [bsz, seqlen, dim] input hidden states
+            start_pos: token offset into the KV cache (0 = prefill, >0 = decode step)
+            rotary_apply_fn: optional callable applied to the last `rope_head_dim`
+                slice of the compressed KV. Signature: `fn(slice, freqs_cis) -> None`
+                (in-place rotary). When None, no rotary applied (a TODO until the
+                parent Attention wires its rotary path through).
+
+        Returns:
+            None when no compression boundary fired this call (decode steps
+            between boundaries) or the compressed KV chunk written to kv_cache
+            (prefill or boundary-firing decode step). Matches V4 reference
+            behavior exactly.
+        """
+        assert self.kv_cache is not None, (
+            "V4Compressor.forward called before parent Attention assigned kv_cache. "
+            "The parent layer must set self.compressor.kv_cache = self.kv_cache[...] "
+            "during its first forward."
+        )
+        bsz, seqlen, _ = x.size()
+        ratio = self.compress_ratio
+        overlap = self.overlap
+        d = self.head_dim
+        rd = self.rope_head_dim
+        dtype = x.dtype
+
+        # Compression runs in fp32 for numerical stability.
+        x = x.float()
+        kv = self.wkv(x)
+        score = self.wgate(x)
+
+        if start_pos == 0:
+            # Prefill path. V4 reference lines 325-342.
+            should_compress = seqlen >= ratio
+            remainder = seqlen % ratio
+            cutoff = seqlen - remainder
+            offset = ratio if overlap else 0
+            if overlap and cutoff >= ratio:
+                self.kv_state[:bsz, :ratio] = kv[:, cutoff - ratio : cutoff]
+                self.score_state[:bsz, :ratio] = score[:, cutoff - ratio : cutoff] + self.ape
+            if remainder > 0:
+                kv, self.kv_state[:bsz, offset : offset + remainder] = kv.split(
+                    [cutoff, remainder], dim=1
+                )
+                self.score_state[:bsz, offset : offset + remainder] = (
+                    score[:, cutoff:] + self.ape[:remainder]
+                )
+                score = score[:, :cutoff]
+            kv = kv.unflatten(1, (-1, ratio))
+            score = score.unflatten(1, (-1, ratio)) + self.ape
+            if overlap:
+                kv = self.overlap_transform(kv, 0)
+                score = self.overlap_transform(score, float("-inf"))
+            kv = (kv * score.softmax(dim=2)).sum(dim=2)
+        else:
+            # Decode path (start_pos > 0). V4 reference lines 343-359.
+            should_compress = (start_pos + 1) % self.compress_ratio == 0
+            score = score + self.ape[start_pos % ratio]
+            if overlap:
+                self.kv_state[:bsz, ratio + start_pos % ratio] = kv.squeeze(1)
+                self.score_state[:bsz, ratio + start_pos % ratio] = score.squeeze(1)
+                if should_compress:
+                    kv_state = torch.cat(
+                        [self.kv_state[:bsz, :ratio, :d], self.kv_state[:bsz, ratio:, d:]],
+                        dim=1,
+                    )
+                    score_state = torch.cat(
+                        [
+                            self.score_state[:bsz, :ratio, :d],
+                            self.score_state[:bsz, ratio:, d:],
+                        ],
+                        dim=1,
+                    )
+                    kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+                    self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
+                    self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
+            else:
+                self.kv_state[:bsz, start_pos % ratio] = kv.squeeze(1)
+                self.score_state[:bsz, start_pos % ratio] = score.squeeze(1)
+                if should_compress:
+                    kv = (
+                        self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)
+                    ).sum(dim=1, keepdim=True)
+
+        if not should_compress:
+            return None
+
+        # RMSNorm + rotary on the rope-head-dim slice.
+        kv = self._rmsnorm(kv.to(dtype))
+
+        if rotary_apply_fn is not None:
+            assert self.freqs_cis is not None, (
+                "V4Compressor.freqs_cis must be assigned by the parent Attention "
+                "before forward when rotary_apply_fn is provided."
+            )
+            if start_pos == 0:
+                freqs_cis = self.freqs_cis[:cutoff:ratio]
+            else:
+                freqs_cis = self.freqs_cis[start_pos + 1 - self.compress_ratio].unsqueeze(0)
+            # In-place rotary on the rope_head_dim slice (V4 reference line 367).
+            rotary_apply_fn(kv[..., -rd:], freqs_cis)
+
+        # TODO(phase1-quant): apply Hadamard + FP4 quant when self.rotate is
+        # True (Indexer path). Apply FP8 act_quant on the no-rope slice when
+        # self.rotate is False (window/HCA path). Both are V4 QAT-simulation
+        # operations; need sgl-kernel implementations. V4 reference lines
+        # 368-372.
+
+        # Write to compressed KV cache. Prefill writes the whole compressed
+        # chunk; decode writes one compressed token at start_pos // ratio.
+        if start_pos == 0:
+            self.kv_cache[:bsz, : seqlen // ratio] = kv
+        else:
+            self.kv_cache[:bsz, start_pos // ratio] = kv.squeeze(1)
+        return kv
 
 
 # ============================================================================
