@@ -2080,40 +2080,37 @@ class DeepseekV4ForCausalLM(nn.Module):
         # discard mtp_dict per its preference.
         state_dict, mtp_dict = _split_v4_mtp_keys(state_dict)
 
-        # Phase 3: FP8 / FP4 dequant for non-FP-aware Linear.
-        # TODO(phase1-fp4): wrap state_dict with a dequantization pass that
-        # consumes (weight, scale) pairs and produces a single BF16/FP32
-        # weight tensor (or, alternatively, skip this if/when V4-aware
-        # FP8/FP4 Linear classes are wired into the model and we keep
-        # weights packed). The needed kernels:
-        #   FP8 e4m3fn weight + e8m0fnu scale (128x128 weight blocks):
-        #       all attn/mtp non-expert linears + ffn.gate.weight +
-        #       ffn.shared_experts.w*. sglang already has this path at
-        #       sglang.srt.layers.quantization.fp8_kernel — reuse.
-        #   FP4 e2m1fn_x2 weight + e8m0fnu scale (1x32 along K):
-        #       ffn.experts.<j>.w{1,2,3} (66048 of the 69187 total keys
-        #       are expert weight + scale tensors). NEW kernel work.
-        # Until then, raise loudly so the smoke test fails at this step
-        # instead of silently in a downstream forward.
-        raise NotImplementedError(
-            f"DeepseekV4ForCausalLM.load_weights — Phases 1-2 DONE on laptop "
-            f"({n_in} input keys -> {len(state_dict)} main + {len(mtp_dict)} MTP "
-            f"keys). Phase 3 (FP8/FP4 dequant) is GPU-required; see "
-            f"TODO(phase1-fp4) above. Run on a GPU VM with a checkpoint "
-            f"that supports torch.float4_e2m1fn_x2 and torch.float8_e8m0fnu."
+        # Phase 3: FP8 / FP4 dequant on load. Path (b) from the docstring —
+        # the dequant-on-load fallback. Memory cost: ~2x blowup on FP4 expert
+        # weights (66048 of 69187 keys). Acceptable for Phase 4 smoke and
+        # Phase 4.5 baselines on H100:8 (640GB) where 159GB FP-stored ->
+        # ~318GB BF16 fits with KV cache headroom. Phase 5 production
+        # training will swap to V4-aware FP8/FP4 Linear classes (path a).
+        state_dict, n_dequanted_fp8, n_dequanted_fp4 = _dequantize_v4_fp8_fp4(
+            state_dict, target_dtype=torch.bfloat16
         )
 
-        # Once Phase 3 lands, complete the loader with:
-        #
-        # missing, unexpected = self.load_state_dict(state_dict, strict=False)
-        # if missing or unexpected:
-        #     logger.warning(
-        #         "V4 weight load: missing=%d unexpected=%d. "
-        #         "First 5 missing: %s. First 5 unexpected: %s. "
-        #         "MTP keys deliberately discarded: %d (rule #12).",
-        #         len(missing), len(unexpected),
-        #         list(missing)[:5], list(unexpected)[:5], len(mtp_dict),
-        #     )
+        # Phase 4: actual load. strict=False so we don't crash on intentional
+        # mismatches (see Sessions 5-7 for the structural list).
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            logger.warning(
+                "V4 weight load: %d input keys -> %d main + %d MTP. "
+                "Dequanted FP8 pairs: %d, FP4 pairs: %d. "
+                "After load: missing=%d, unexpected=%d. "
+                "First 5 missing: %s. First 5 unexpected: %s.",
+                n_in, len(state_dict), len(mtp_dict),
+                n_dequanted_fp8, n_dequanted_fp4,
+                len(missing), len(unexpected),
+                list(missing)[:5], list(unexpected)[:5],
+            )
+        else:
+            logger.info(
+                "V4 weight load OK: %d input keys -> %d main + %d MTP. "
+                "Dequanted FP8 pairs: %d, FP4 pairs: %d.",
+                n_in, len(state_dict), len(mtp_dict),
+                n_dequanted_fp8, n_dequanted_fp4,
+            )
 
 
 # ============================================================================
@@ -2312,6 +2309,214 @@ def _split_v4_mtp_keys(
         else:
             main_dict[key] = tensor
     return main_dict, mtp_dict
+
+
+# ============================================================================
+# FP8 / FP4 dequant-on-load helpers
+# ============================================================================
+#
+# V4-Flash stores weights in two block-quantized formats:
+#
+#   1. FP8 e4m3fn weight + e8m0fnu scale, 128x128 blocks
+#      Used for: all attn linears, MTP linears, ffn.gate, ffn.shared_experts
+#      Scale shape: (ceil(out/128), ceil(in/128))
+#      Reuses sglang.srt.layers.quantization.fp8_utils.block_quant_dequant
+#
+#   2. FP4 e2m1fn_x2 (or uint8-packed pairs) weight + e8m0fnu scale,
+#      1x32 blocks along K. Used for: ffn.experts.<j>.w{1,2,3}
+#      Storage: weight is uint8 (or float4_e2m1fn_x2), shape (out, in/2);
+#               scale is uint8 (or float8_e8m0fnu), shape (out, in/32).
+#      Reuses sglang.srt.layers.quantization.mxfp4_tensor.MXFP4QuantizeUtil
+#
+# Both scale tensors are e8m0 = unsigned 8-bit "exponent only" representation.
+# Decoded scale value = 2^(byte - 127). Modern PyTorch (>=2.5) loads as
+# torch.float8_e8m0fnu; older versions store as torch.uint8. We handle both.
+#
+# Path (b) from load_weights docstring: dequant on load to BF16. Trades ~2x
+# memory blowup on experts for "the model just works" (no V4-aware Linear
+# class wiring needed yet). Phase 5 production training will swap to the
+# quant-aware path (a).
+#
+# Tested via test/manual/models/test_deepseek_v4_models.py:
+#   - test_dequantize_synthetic_fp8 (FP8 e4m3fn -> BF16 round-trip)
+#   - test_dequantize_synthetic_fp4 (MXFP4 -> BF16 round-trip)
+#   - test_dequantize_v4_state_dict_synthetic (full helper E2E with mock V4 keys)
+
+
+def _e8m0_to_float(scale: torch.Tensor) -> torch.Tensor:
+    """Convert an e8m0fnu scale tensor to a float32 multiplier.
+
+    e8m0fnu is an 8-bit unsigned "exponent-only" float: value = 2^(byte - 127).
+    Modern torch (>=2.5) supports torch.float8_e8m0fnu natively;
+    older versions store as torch.uint8.
+
+    Returns float32 tensor of the same shape, with each element = 2^(byte-127).
+    """
+    if hasattr(torch, "float8_e8m0fnu") and scale.dtype == torch.float8_e8m0fnu:
+        # Native dtype — torch's .to(float32) decodes to the correct multiplier.
+        return scale.to(torch.float32)
+    if scale.dtype == torch.uint8:
+        return torch.exp2(scale.to(torch.float32) - 127.0)
+    # Already a float scale (e.g. caller pre-decoded). Pass through.
+    return scale.to(torch.float32)
+
+
+def _scale_to_e8m0_bytes(scale: torch.Tensor) -> torch.Tensor:
+    """Inverse of _e8m0_to_float: encode a float scale as raw uint8 e8m0 bytes.
+
+    Required by MXFP4QuantizeUtil.dequantize, which expects uint8 raw e8m0
+    bytes and applies `exp2(scale.float() - 127)` internally.
+    """
+    if scale.dtype == torch.uint8:
+        return scale
+    if hasattr(torch, "float8_e8m0fnu") and scale.dtype == torch.float8_e8m0fnu:
+        # Reinterpret the underlying byte storage (1 byte per scalar).
+        return scale.view(torch.uint8)
+    # Float scale (rare path). Encode by inverting `exp2(byte-127)`.
+    bytes_f = torch.round(torch.log2(scale.to(torch.float32).clamp(min=2.0**-127)) + 127.0)
+    return bytes_f.clamp(0, 255).to(torch.uint8)
+
+
+def _dequant_fp8_blockwise(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    target_dtype: torch.dtype = torch.bfloat16,
+    block_size: Tuple[int, int] = (128, 128),
+) -> torch.Tensor:
+    """Dequant FP8 e4m3fn weight + e8m0 scale (128x128 blocks) -> target_dtype.
+
+    Reuses sglang.srt.layers.quantization.fp8_utils.block_quant_dequant.
+    """
+    from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+
+    scale_f = _e8m0_to_float(scale)
+    return block_quant_dequant(weight, scale_f, list(block_size), target_dtype)
+
+
+def _dequant_mxfp4(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    target_dtype: torch.dtype = torch.bfloat16,
+    block_size: int = 32,
+) -> torch.Tensor:
+    """Dequant FP4 e2m1fn_x2 (uint8-packed pairs) + e8m0 scale (1x32 along K).
+
+    Reuses sglang.srt.layers.quantization.mxfp4_tensor.MXFP4QuantizeUtil.
+    """
+    from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+
+    # MXFP4QuantizeUtil expects:
+    #   quantized_data: uint8 packed pairs (out, in/2)
+    #   scale: uint8 raw e8m0 bytes (out, in/32)
+    weight_packed = weight
+    if hasattr(torch, "float4_e2m1fn_x2") and weight.dtype == torch.float4_e2m1fn_x2:
+        weight_packed = weight.view(torch.uint8)
+    elif weight.dtype != torch.uint8:
+        raise ValueError(
+            f"_dequant_mxfp4: expected uint8 or float4_e2m1fn_x2 weight, got {weight.dtype}"
+        )
+
+    scale_bytes = _scale_to_e8m0_bytes(scale)
+    return MXFP4QuantizeUtil.dequantize(weight_packed, target_dtype, scale_bytes, [block_size])
+
+
+def _classify_v4_weight_scale_pair(
+    weight: torch.Tensor, scale: torch.Tensor
+) -> str:
+    """Classify a (weight, scale) pair as 'fp8', 'fp4', or 'unknown'.
+
+    Discrimination is by weight dtype + scale-shape ratio:
+      - FP8 e4m3fn weight: dtype is float8_e4m3fn (modern torch) OR
+        the scale shape ratio is 128:1 in both dims (legacy uint8 storage).
+      - FP4 e2m1fn_x2 weight: dtype is float4_e2m1fn_x2 (modern torch) OR
+        weight is uint8 with packed-K scale ratio 16:1 (= logical-K 32:1).
+      - Otherwise: 'unknown' (pass through).
+
+    Edge case: the V4 checkpoint has both formats; weight.dtype alone is
+    sufficient when torch supports the native dtypes. The shape fallback
+    is only needed for older torch + uint8-stored weights.
+    """
+    if weight.dtype == torch.float8_e4m3fn:
+        return "fp8"
+    if hasattr(torch, "float4_e2m1fn_x2") and weight.dtype == torch.float4_e2m1fn_x2:
+        return "fp4"
+    if weight.dtype == torch.uint8:
+        # Legacy storage path — disambiguate by scale shape ratio.
+        # FP4 packed: weight shape (..., out, in/2), scale shape (..., out, in/32).
+        # FP8 blockwise: weight shape (..., out, in), scale shape (..., out/128, in/128).
+        if weight.dim() >= 2 and scale.dim() >= 2:
+            *_, w_n, w_k = weight.shape
+            *_, s_n, s_k = scale.shape
+            # FP4: scale K-dim = packed-K * 2 / 32 = packed-K / 16, scale N-dim = weight N-dim.
+            if s_n == w_n and w_k > 0 and s_k * 16 == w_k:
+                return "fp4"
+            # FP8: 128:1 ratio in both dims.
+            if s_n * 128 >= w_n > (s_n - 1) * 128 and s_k * 128 >= w_k > (s_k - 1) * 128:
+                return "fp8"
+    return "unknown"
+
+
+def _dequantize_v4_fp8_fp4(
+    state_dict: Dict[str, torch.Tensor],
+    target_dtype: torch.dtype = torch.bfloat16,
+) -> Tuple[Dict[str, torch.Tensor], int, int]:
+    """Dequantize V4-Flash FP8 + FP4 (weight, scale) pairs in state_dict.
+
+    For each `<name>.weight` whose `<name>.scale` exists, replaces the weight
+    with the dequantized BF16 (or target_dtype) tensor and drops the scale.
+    Non-quantized tensors pass through unchanged.
+
+    Args:
+        state_dict: V4 state_dict, post-key-remap and post-MTP-split.
+        target_dtype: dtype to dequant into (default bf16).
+
+    Returns:
+        (new_state_dict, n_dequanted_fp8, n_dequanted_fp4)
+    """
+    out: Dict[str, torch.Tensor] = {}
+    consumed_scales: set = set()
+    n_fp8 = 0
+    n_fp4 = 0
+
+    pair_keys = [
+        k for k in state_dict
+        if k.endswith(".weight") and (k[:-len(".weight")] + ".scale") in state_dict
+    ]
+
+    for weight_key in pair_keys:
+        scale_key = weight_key[:-len(".weight")] + ".scale"
+        weight = state_dict[weight_key]
+        scale = state_dict[scale_key]
+
+        kind = _classify_v4_weight_scale_pair(weight, scale)
+        if kind == "fp8":
+            out[weight_key] = _dequant_fp8_blockwise(weight, scale, target_dtype)
+            consumed_scales.add(scale_key)
+            n_fp8 += 1
+        elif kind == "fp4":
+            out[weight_key] = _dequant_mxfp4(weight, scale, target_dtype)
+            consumed_scales.add(scale_key)
+            n_fp4 += 1
+        else:
+            logger.warning(
+                "V4 dequant: unrecognized (weight=%s shape=%s, scale=%s shape=%s) "
+                "for key %s — passing through unchanged.",
+                weight.dtype, tuple(weight.shape), scale.dtype, tuple(scale.shape),
+                weight_key,
+            )
+            out[weight_key] = weight
+            # Don't consume scale — let it pass through too (will be flagged as
+            # unexpected by load_state_dict, which is the right signal).
+
+    # Copy remaining keys (non-quantized + un-consumed scales for unknowns).
+    for k, v in state_dict.items():
+        if k in consumed_scales:
+            continue
+        if k in out:
+            continue
+        out[k] = v
+
+    return out, n_fp8, n_fp4
 
 
 # ============================================================================
