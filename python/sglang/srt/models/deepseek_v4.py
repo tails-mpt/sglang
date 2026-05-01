@@ -2399,9 +2399,14 @@ def _dequant_mxfp4(
     target_dtype: torch.dtype = torch.bfloat16,
     block_size: int = 32,
 ) -> torch.Tensor:
-    """Dequant FP4 e2m1fn_x2 (uint8-packed pairs) + e8m0 scale (1x32 along K).
+    """Dequant FP4 e2m1fn_x2 (uint8/int8-packed pairs) + e8m0 scale (1x32 along K).
 
     Reuses sglang.srt.layers.quantization.mxfp4_tensor.MXFP4QuantizeUtil.
+
+    V4-Flash stores packed pairs as torch.int8 (verified on real V4 shard 2,
+    e.g. layers.0.ffn.experts.0.w1.weight). int8 and uint8 are both 1-byte
+    integer types — the underlying bit pattern is what matters for FP4 unpacking.
+    `view(torch.uint8)` reinterprets bits without copy.
     """
     from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 
@@ -2411,9 +2416,12 @@ def _dequant_mxfp4(
     weight_packed = weight
     if hasattr(torch, "float4_e2m1fn_x2") and weight.dtype == torch.float4_e2m1fn_x2:
         weight_packed = weight.view(torch.uint8)
+    elif weight.dtype == torch.int8:
+        # V4 stores as int8 packed pairs; reinterpret as uint8 (same byte layout).
+        weight_packed = weight.view(torch.uint8)
     elif weight.dtype != torch.uint8:
         raise ValueError(
-            f"_dequant_mxfp4: expected uint8 or float4_e2m1fn_x2 weight, got {weight.dtype}"
+            f"_dequant_mxfp4: expected uint8/int8 or float4_e2m1fn_x2 weight, got {weight.dtype}"
         )
 
     scale_bytes = _scale_to_e8m0_bytes(scale)
@@ -2440,8 +2448,10 @@ def _classify_v4_weight_scale_pair(
         return "fp8"
     if hasattr(torch, "float4_e2m1fn_x2") and weight.dtype == torch.float4_e2m1fn_x2:
         return "fp4"
-    if weight.dtype == torch.uint8:
-        # Legacy storage path — disambiguate by scale shape ratio.
+    # V4-Flash uses torch.int8 packed pairs for FP4 expert weights (verified
+    # on real V4 shard 2). torch.uint8 is the alternative legacy storage.
+    if weight.dtype in (torch.uint8, torch.int8):
+        # Disambiguate by scale shape ratio.
         # FP4 packed: weight shape (..., out, in/2), scale shape (..., out, in/32).
         # FP8 blockwise: weight shape (..., out, in), scale shape (..., out/128, in/128).
         if weight.dim() >= 2 and scale.dim() >= 2:
