@@ -59,6 +59,8 @@
 from __future__ import annotations
 
 import logging
+import math
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -79,6 +81,172 @@ from transformers import PretrainedConfig
 # component is ported.)
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Module-level helpers ported from V4 reference inference/model.py
+# ============================================================================
+# These five helpers are direct ports. They will be replaced with sglang-native
+# equivalents at integration time:
+#   - `precompute_freqs_cis_yarn` -> sglang's RotaryEmbedding with YaRN scaling
+#   - `apply_rotary_emb` -> sglang's apply_rotary_pos_emb (after kernel parity check)
+#   - `get_window_topk_idxs` / `get_compress_topk_idxs` -> sglang NSA equivalent
+#     where one exists; otherwise stay here
+#
+# Keeping them as standalone functions matches the V4 reference exactly and
+# makes numerical agreement testing trivial in the unit-test phase.
+
+
+@lru_cache(maxsize=4)
+def precompute_freqs_cis_yarn(
+    dim: int,
+    seqlen: int,
+    original_seq_len: int,
+    base: float,
+    factor: float,
+    beta_fast: int,
+    beta_slow: int,
+) -> torch.Tensor:
+    """Precompute complex exponentials for rotary embeddings with YaRN scaling.
+
+    Direct port of V4 reference `precompute_freqs_cis` (lines 199-229).
+    When `original_seq_len > 0`, applies YaRN frequency interpolation with a
+    smooth linear ramp between `beta_fast` and `beta_slow` correction ranges.
+
+    V4-Flash uses two different invocations:
+      - sliding-window-only path: original_seq_len=0, base=10000 (no YaRN)
+      - compressed-KV path: original_seq_len=65536, base=160000, factor=16
+        (YaRN scaling from 64K to 1M)
+
+    Args:
+        dim: rotary head dim (= rope_head_dim, default 64 for V4)
+        seqlen: max sequence length to precompute up to (= max_position_embeddings)
+        original_seq_len: pre-YaRN context length; 0 disables YaRN
+        base: rope_theta (10000 for window-only, 160000 for compressed)
+        factor: YaRN scale factor (16 for V4-Flash)
+        beta_fast: high-frequency YaRN cutoff (32 for V4)
+        beta_slow: low-frequency YaRN cutoff (1 for V4)
+
+    Returns:
+        Complex tensor of shape `[seqlen, dim // 2]` containing freqs_cis.
+    """
+
+    def find_correction_dim(num_rotations: int, dim: int, base: float, max_seq_len: int) -> float:
+        return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+
+    def find_correction_range(
+        low_rot: int, high_rot: int, dim: int, base: float, max_seq_len: int
+    ) -> Tuple[int, int]:
+        low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
+        high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
+        return max(low, 0), min(high, dim - 1)
+
+    def linear_ramp_factor(low: float, high: float, dim: int) -> torch.Tensor:
+        if low == high:
+            high = high + 0.001
+        linear_func = (torch.arange(dim, dtype=torch.float32) - low) / (high - low)
+        return torch.clamp(linear_func, 0, 1)
+
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    if original_seq_len > 0:
+        low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_seq_len)
+        smooth = 1 - linear_ramp_factor(low, high, dim // 2)
+        freqs = freqs / factor * (1 - smooth) + freqs * smooth
+
+    t = torch.arange(seqlen)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_cis
+
+
+def apply_rotary_emb_v4(
+    x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
+) -> torch.Tensor:
+    """Apply rotary positional embeddings in-place. Direct port of V4 reference
+    `apply_rotary_emb` (lines 232-244).
+
+    Uses conjugate for inverse (de-rotation, used after attention output).
+    Suffix `_v4` to avoid clashing with sglang's existing apply_rotary_pos_emb;
+    will be unified when the kernel-parity check is done.
+    """
+    y = x
+    x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
+    if inverse:
+        freqs_cis = freqs_cis.conj()
+    if x.ndim == 3:
+        freqs_cis = freqs_cis.view(1, x.size(1), x.size(-1))
+    else:
+        freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
+    x = torch.view_as_real(x * freqs_cis).flatten(-2)
+    y.copy_(x)
+    return y
+
+
+@lru_cache(maxsize=1)
+def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int) -> torch.Tensor:
+    """Build the per-token top-k index matrix for sliding-window attention.
+
+    Direct port of V4 reference (lines 254-265). `lru_cache` keyed on the
+    args because the result depends only on (window_size, bsz, seqlen,
+    start_pos) — not on token content.
+    """
+    if start_pos >= window_size - 1:
+        start_pos = start_pos % window_size
+        matrix = torch.cat(
+            [torch.arange(start_pos + 1, window_size), torch.arange(0, start_pos + 1)],
+            dim=0,
+        )
+    elif start_pos > 0:
+        matrix = F.pad(torch.arange(start_pos + 1), (0, window_size - start_pos - 1), value=-1)
+    else:
+        base = torch.arange(seqlen).unsqueeze(1)
+        matrix = (base - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
+        matrix = torch.where(matrix > base, -1, matrix)
+    return matrix.unsqueeze(0).expand(bsz, -1, -1)
+
+
+@lru_cache(maxsize=2)
+def get_compress_topk_idxs(
+    ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int
+) -> torch.Tensor:
+    """Build the per-token top-k index matrix for the compressed-KV branch.
+
+    Direct port of V4 reference (lines 268-276). Used by HCA layers
+    (compress_ratio=128) where the top-k is deterministic stride selection
+    rather than learned-index (CSA's Indexer).
+    """
+    if start_pos > 0:
+        matrix = torch.arange(0, (start_pos + 1) // ratio) + offset
+    else:
+        matrix = torch.arange(seqlen // ratio).repeat(seqlen, 1)
+        mask = matrix >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
+        matrix = torch.where(mask, -1, matrix + offset)
+    return matrix.unsqueeze(0).expand(bsz, -1, -1)
+
+
+def sparse_attn_v4(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Sparse attention kernel for V4 CSA + HCA layers.
+
+    TODO(phase1-kernel): wire to sglang's NSA tilelang kernel
+    (sglang/srt/layers/attention/nsa/tilelang_kernel.py). The V3.2 NSA path
+    uses the same shape contract: Q [b, s, h, d], KV [b, k, d] with single
+    shared K/V head (MQA), topk_idxs [b, s, k_per_query] selecting from KV
+    along the k axis, attn_sink [h] adding a per-head sink-token
+    contribution, softmax_scale = head_dim ** -0.5.
+
+    Until wired, this raises so any actual forward call is caught loudly
+    instead of silently returning garbage.
+    """
+    raise NotImplementedError(
+        "sparse_attn_v4: wire to sglang/srt/layers/attention/nsa/tilelang_kernel.py "
+        "(see TODO(phase1-kernel))."
+    )
 
 
 # ============================================================================
@@ -385,78 +553,284 @@ class V4Compressor(nn.Module):
 
 
 # ============================================================================
-# CSAAttention — Compressed Sparse Attention (compress_ratio=4 + Indexer)
+# V4Attention — single class for all three attention modes (matches V4 reference)
 # ============================================================================
+#
+# The V4 reference impl (inference/model.py:Attention) is one class that
+# dispatches per-instance on `compress_ratio = config.compress_ratios[layer_id]`:
+#   - compress_ratio == 0   -> window-only (no Compressor, no Indexer)
+#   - compress_ratio == 4   -> CSA (Compressor + Indexer)
+#   - compress_ratio == 128 -> HCA (Compressor, no Indexer; uses
+#                                  get_compress_topk_idxs)
+#
+# Following the reference exactly is the cheapest path to numerical agreement.
+# Splitting into three classes was a scaffolding placeholder — collapsed here
+# 2026-04-30 once the V4 reference Attention.__init__ + .forward were ported.
 
 
-class CSAAttention(nn.Module):
-    """V4 CSA layer: sliding window + Indexer + Compressor.
+class V4Attention(nn.Module):
+    """V4 attention layer, single class for window-only / CSA / HCA modes.
 
-    Reuses V3.2 NSA Indexer (sglang.srt.layers.attention.nsa.nsa_indexer.Indexer)
-    and the sparse_attn tilelang kernel.
+    Direct port of /tmp/v4-flash-meta/inference/model.py:Attention (lines
+    436-543). Q path uses MLA-shaped low-rank projection (wq_a -> q_norm
+    -> wq_b, q_lora_rank=1024); O path uses grouped low-rank projection
+    (wo_a/wo_b with o_groups=8, o_lora_rank=1024); K/V path uses MQA
+    (single shared K/V head fed via wkv: dim -> head_dim).
 
-    TODO(phase1-port): wire NSA Indexer with V4-specific config. The V3.2
-    NSA path in deepseek_v2.py:1231 is the integration template. Differences:
-      - V4 uses MQA (n_kv_heads=1), not MLA. Q/O paths are MLA-shaped (q_lora,
-        grouped low-rank O); K/V paths are MQA-shaped (single shared head).
-      - compress_ratio=4 (V4 default for CSA) — set via Indexer config.
-      - V4 has dual rope_theta: 10000 for the window-only path, 160000 for
-        the compressed KV path. NSA Indexer uses one rope_theta — needs
-        extension or per-call override.
+    Per-layer dispatch via `compress_ratio`:
+      - 0: window-only attention. No Compressor, no Indexer. Uses
+           get_window_topk_idxs for the topk index matrix.
+      - 4: CSA. Compressor + Indexer (V3.2 NSA Indexer). topk_idxs is the
+           concatenation of window indices and Indexer-selected compressed
+           KV indices.
+      - 128: HCA. Compressor only (no Indexer). topk_idxs is the
+             concatenation of window indices and deterministic stride
+             indices from get_compress_topk_idxs.
+
+    KV cache layout: `kv_cache[:bsz, :window_size]` holds the sliding
+    window; `kv_cache[:bsz, window_size:]` holds compressed KV when
+    compress_ratio is non-zero. The Compressor's `kv_cache` member aliases
+    the compressed section (assigned lazily in forward()).
+
+    Differences from V4 reference, all flagged inline as TODO markers:
+
+    - Linear/ColumnParallelLinear/RowParallelLinear: V4 reference's parallel
+      Linear classes are TP-aware. We use `nn.Linear` here pending sglang
+      TP-aware refactor (TODO(phase1-tp)). On a single GPU with world_size=1
+      the behavior is identical.
+    - sparse_attn: stubbed (raises) until wired to sglang NSA tilelang
+      (TODO(phase1-kernel)).
+    - act_quant calls (V4 reference line 506) skipped pending FP8 quant
+      wiring (TODO(phase1-quant)).
+    - Indexer: V3.2 sglang Indexer at sglang.srt.layers.attention.nsa.nsa_indexer
+      will plug into self.indexer when compress_ratio == 4 (TODO(phase1-nsa)).
     """
 
     def __init__(self, layer_id: int, config: PretrainedConfig):
         super().__init__()
         self.layer_id = layer_id
-        # TODO(phase1-port): full body
-        raise NotImplementedError("CSAAttention scaffold — see TODO(phase1-port)")
+
+        self.dim = config.hidden_size
+        self.n_heads = config.num_attention_heads
+        # TP-aware: divide n_heads by world size; with world_size=1 this is identity.
+        self.n_local_heads = self.n_heads  # TODO(phase1-tp): // world_size
+        self.q_lora_rank = config.q_lora_rank
+        self.o_lora_rank = config.o_lora_rank
+        self.head_dim = config.head_dim
+        self.rope_head_dim = getattr(config, "qk_rope_head_dim", config.head_dim)
+        self.nope_head_dim = self.head_dim - self.rope_head_dim
+        self.n_groups = config.o_groups
+        self.n_local_groups = self.n_groups  # TODO(phase1-tp): // world_size
+        self.window_size = config.sliding_window
+        self.compress_ratio = config.compress_ratios[layer_id]
+        self.eps = config.rms_norm_eps
+
+        # Attention sink (per-head; V4 reference line 456). Float32.
+        self.attn_sink = nn.Parameter(torch.empty(self.n_local_heads, dtype=torch.float32))
+
+        # Q path: low-rank projection (q_lora_rank=1024).
+        # TODO(phase1-tp): wq_a is replicated, wq_b is column-parallel.
+        self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False)
+        # Use functional RMSNorm matching V4 reference; will swap to sglang's
+        # RMSNorm once external-weight API lands (TODO(phase1-norm)).
+        self.q_norm_weight = nn.Parameter(torch.ones(self.q_lora_rank, dtype=torch.float32))
+        self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+
+        # K/V path: MQA (single shared head). wkv: dim -> head_dim.
+        self.wkv = nn.Linear(self.dim, self.head_dim, bias=False)
+        self.kv_norm_weight = nn.Parameter(torch.ones(self.head_dim, dtype=torch.float32))
+
+        # O path: grouped low-rank projection.
+        # wo_a is column-parallel: (n_heads * head_dim / n_groups, n_groups * o_lora_rank)
+        # wo_b is row-parallel: (n_groups * o_lora_rank, dim)
+        self.wo_a = nn.Linear(
+            self.n_heads * self.head_dim // self.n_groups,
+            self.n_groups * self.o_lora_rank,
+            bias=False,
+            dtype=torch.bfloat16,
+        )
+        self.wo_b = nn.Linear(self.n_groups * self.o_lora_rank, self.dim, bias=False)
+
+        self.softmax_scale = self.head_dim ** -0.5
+
+        # Optional Compressor + Indexer per compress_ratio.
+        if self.compress_ratio:
+            self.compressor = V4Compressor(
+                hidden_size=self.dim,
+                head_dim=self.head_dim,
+                compress_ratio=self.compress_ratio,
+                rope_head_dim=self.rope_head_dim,
+                max_batch_size=getattr(config, "max_batch_size", 4),
+                norm_eps=self.eps,
+                rotate=(self.compress_ratio == 4),  # CSA uses Hadamard rotation; HCA doesn't
+            )
+            if self.compress_ratio == 4:
+                # TODO(phase1-nsa): plug in sglang's V3.2 NSA Indexer here.
+                # `self.indexer = NSAIndexer(...)` once configured for V4 args.
+                self.indexer = None
+            else:
+                # HCA: no learned Indexer, deterministic stride selection.
+                self.indexer = None
+        else:
+            self.compressor = None
+            self.indexer = None
+
+        # KV cache buffer. Window section + optional compressed section.
+        max_seq_len = config.max_position_embeddings
+        max_batch_size = getattr(config, "max_batch_size", 4)
+        kv_cache_size = self.window_size + (
+            max_seq_len // self.compress_ratio if self.compress_ratio else 0
+        )
+        self.register_buffer(
+            "kv_cache",
+            torch.zeros(max_batch_size, kv_cache_size, self.head_dim),
+            persistent=False,
+        )
+
+        # Rotary frequencies. Two regimes per V4 reference lines 475-481:
+        #   compress_ratio != 0 -> YaRN with compress_rope_theta (160000) from
+        #                          original_seq_len (65536) up to max_seq_len (1M)
+        #   compress_ratio == 0 -> no YaRN, base rope_theta (10000)
+        if self.compress_ratio:
+            original_seq_len = config.rope_scaling["original_max_position_embeddings"]
+            rope_theta = config.compress_rope_theta
+            rope_factor = config.rope_scaling["factor"]
+        else:
+            original_seq_len = 0
+            rope_theta = config.rope_theta
+            rope_factor = 1.0
+        beta_fast = config.rope_scaling.get("beta_fast", 32)
+        beta_slow = config.rope_scaling.get("beta_slow", 1)
+        freqs_cis = precompute_freqs_cis_yarn(
+            self.rope_head_dim,
+            max_seq_len,
+            original_seq_len,
+            rope_theta,
+            rope_factor,
+            beta_fast,
+            beta_slow,
+        )
+        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+
+    # -----------------------------------------------------------------
+    # RMSNorm helpers (functional; matches V4 reference exactly)
+    # -----------------------------------------------------------------
+
+    def _q_norm(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        x32 = x.float()
+        var = x32.square().mean(-1, keepdim=True)
+        x32 = x32 * torch.rsqrt(var + self.eps)
+        return (self.q_norm_weight * x32).to(dtype)
+
+    def _kv_norm(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        x32 = x.float()
+        var = x32.square().mean(-1, keepdim=True)
+        x32 = x32 * torch.rsqrt(var + self.eps)
+        return (self.kv_norm_weight * x32).to(dtype)
+
+    # -----------------------------------------------------------------
+    # forward
+    # -----------------------------------------------------------------
+
+    def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
+        """V4 attention forward. Direct port of V4 reference (lines 484-543)."""
+        bsz, seqlen, _ = x.size()
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        win = self.window_size
+        ratio = self.compress_ratio
+        rd = self.rope_head_dim
+
+        # Lazy wiring: parent Compressor/Indexer get the kv_cache + freqs_cis on first call.
+        if self.compress_ratio and self.compressor.kv_cache is None:
+            self.compressor.kv_cache = self.kv_cache[:, win:]
+            self.compressor.freqs_cis = self.freqs_cis
+            if self.indexer is not None:
+                self.indexer.freqs_cis = self.freqs_cis
+
+        # ---- Q ----
+        qr = q = self._q_norm(self.wq_a(x))
+        q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
+        # Per-head RMS scaling (V4 reference line 498).
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+        apply_rotary_emb_v4(q[..., -rd:], freqs_cis)
+
+        # ---- Window K/V ----
+        kv = self.wkv(x)
+        kv = self._kv_norm(kv)
+        apply_rotary_emb_v4(kv[..., -rd:], freqs_cis)
+        # TODO(phase1-quant): act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
+        # FP8-simulate non-rope dims to match QAT; rope dims stay bf16 for
+        # positional precision. Skipped pending FP8 quant wiring.
+
+        topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos)
+        if self.compress_ratio:
+            offset = kv.size(1) if start_pos == 0 else win
+            if self.indexer is not None:
+                # CSA path: learned-index topk via the Indexer.
+                # TODO(phase1-nsa): self.indexer(x, qr, start_pos, offset)
+                raise NotImplementedError(
+                    "V4Attention CSA path: Indexer not yet wired (TODO(phase1-nsa))."
+                )
+            else:
+                # HCA path: deterministic stride topk.
+                compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset)
+                topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+        topk_idxs = topk_idxs.int()
+
+        # ---- Compress KV + sparse attention ----
+        if start_pos == 0:
+            # Prefill: write the last `win` tokens into the window cache. If
+            # seqlen > win, the older tokens are dropped (sliding window).
+            if seqlen <= win:
+                self.kv_cache[:bsz, :seqlen] = kv
+            else:
+                cutoff = seqlen % win
+                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = (
+                    kv[:, -win:].split([win - cutoff, cutoff], dim=1)
+                )
+            if self.compress_ratio:
+                kv_compress = self.compressor(x, start_pos, rotary_apply_fn=apply_rotary_emb_v4)
+                if kv_compress is not None:
+                    kv = torch.cat([kv, kv_compress], dim=1)
+            o = sparse_attn_v4(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+        else:
+            # Decode: write the single new token at start_pos % win.
+            self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+            if self.compress_ratio:
+                self.compressor(x, start_pos, rotary_apply_fn=apply_rotary_emb_v4)
+            o = sparse_attn_v4(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
+
+        # Inverse rotary on output (V4 reference line 534).
+        apply_rotary_emb_v4(o[..., -rd:], freqs_cis, inverse=True)
+
+        # ---- O projection (grouped low-rank) ----
+        o = o.view(bsz, seqlen, self.n_local_groups, -1)
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        # NOTE: wo_a is FP8 in checkpoint; could do FP8 einsum for better perf,
+        # but using BF16 here for simplicity (matches V4 reference comment).
+        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        x = self.wo_b(o.flatten(2))
+        return x
 
 
-# ============================================================================
-# HCAAttention — Heavily Compressed Attention (compress_ratio=128, no Indexer)
-# ============================================================================
+# Keep backward-compat aliases for the three names; their __init__ now
+# delegates to V4Attention. This lets external code that imported the old
+# names continue to work during the porting window.
+class CSAAttention(V4Attention):
+    """Alias preserved for backward-compat. Use V4Attention directly going forward."""
+    pass
 
 
-class HCAAttention(nn.Module):
-    """V4 HCA layer: sliding window + heavy Compressor (no Indexer).
-
-    Uses the V3.2 NSA sparse_attn kernel with `topk_idxs` from
-    `get_compress_topk_idxs` (deterministic stride selection) instead of the
-    Indexer's learned-index topk.
-
-    TODO(phase1-port): write the topk_idxs construction (port from V4
-    reference inference/model.py:get_compress_topk_idxs lines 268-276) and
-    wire it through the same sparse_attn kernel CSA uses. KV-cache layout
-    differs from CSA: only the heavy-Compressor path, no Indexer kv_cache.
-    """
-
-    def __init__(self, layer_id: int, config: PretrainedConfig):
-        super().__init__()
-        self.layer_id = layer_id
-        # TODO(phase1-port): full body
-        raise NotImplementedError("HCAAttention scaffold — see TODO(phase1-port)")
+class HCAAttention(V4Attention):
+    """Alias preserved for backward-compat. Use V4Attention directly going forward."""
+    pass
 
 
-# ============================================================================
-# WindowOnlyAttention — sliding window only (compress_ratio=0)
-# ============================================================================
-
-
-class WindowOnlyAttention(nn.Module):
-    """V4 window-only layer (used at layers 0, 1, 42).
-
-    No compression branch. Pure sliding-window MLA-shaped Q/O + MQA-shaped K/V.
-    rope_theta=10000, no YaRN scaling on this path.
-
-    TODO(phase1-port): standard MQA + sliding window. The V3.2 NSA path
-    has a window-only fallback (when is_deepseek_nsa is False); reuse that.
-    """
-
-    def __init__(self, layer_id: int, config: PretrainedConfig):
-        super().__init__()
-        self.layer_id = layer_id
-        # TODO(phase1-port): full body
-        raise NotImplementedError("WindowOnlyAttention scaffold — see TODO(phase1-port)")
+class WindowOnlyAttention(V4Attention):
+    """Alias preserved for backward-compat. Use V4Attention directly going forward."""
+    pass
 
 
 # ============================================================================
@@ -559,28 +933,60 @@ class DeepseekV4DecoderLayer(nn.Module):
         super().__init__()
         self.layer_id = layer_id
 
-        # Per-layer attention dispatch
-        compress_ratio = config.compress_ratios[layer_id]
-        attn_type = V4LayerAttentionType.from_compress_ratio(compress_ratio)
-        if attn_type == V4LayerAttentionType.WINDOW_ONLY:
-            self.attn = WindowOnlyAttention(layer_id, config)
-        elif attn_type == V4LayerAttentionType.CSA:
-            self.attn = CSAAttention(layer_id, config)
-        elif attn_type == V4LayerAttentionType.HCA:
-            self.attn = HCAAttention(layer_id, config)
+        # Single-class attention. Per-layer behavior is encoded in
+        # config.compress_ratios[layer_id] which the V4Attention __init__
+        # consumes directly.
+        self.attn = V4Attention(layer_id, config)
 
+        # MoE feed-forward. V4Gate inside DeepseekV4MoE checks
+        # layer_id < config.num_hash_layers for the hash-routing branch.
         self.ffn = DeepseekV4MoE(layer_id, config)
+
+        # mHC residual-stream wrapping. Wraps both attn and ffn separately.
         self.hc = V4HCBlock(
             hidden_size=config.hidden_size,
             hc_mult=getattr(config, "hc_mult", 4),
             hc_sinkhorn_iters=getattr(config, "hc_sinkhorn_iters", 20),
             hc_eps=getattr(config, "hc_eps", 1e-6),
         )
-        # TODO(phase1-port): attn_norm, ffn_norm RMSNorm
 
-    def forward(self, x, *args, **kwargs):
-        # TODO(phase1-port): mHC pre/post wrapping per V4 reference Block.forward
-        raise NotImplementedError("DeepseekV4DecoderLayer.forward scaffold — see TODO(phase1-port)")
+        # Pre-sublayer RMSNorms (matching V4 reference Block.__init__ lines
+        # 658-659). Functional impl pending sglang RMSNorm external-weight API.
+        self.attn_norm_weight = nn.Parameter(torch.ones(config.hidden_size, dtype=torch.float32))
+        self.ffn_norm_weight = nn.Parameter(torch.ones(config.hidden_size, dtype=torch.float32))
+        self.norm_eps = config.rms_norm_eps
+
+    def _norm(self, x: torch.Tensor, weight: nn.Parameter) -> torch.Tensor:
+        dtype = x.dtype
+        x32 = x.float()
+        var = x32.square().mean(-1, keepdim=True)
+        x32 = x32 * torch.rsqrt(var + self.norm_eps)
+        return (weight * x32).to(dtype)
+
+    def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """V4 transformer block forward with mHC residuals.
+
+        Direct port of V4 reference Block.forward (lines 688-700). Each
+        sublayer is wrapped: hc_pre folds 4 copies -> 1 input, sublayer runs,
+        hc_post expands 1 -> 4 copies for the next sublayer.
+
+        TODO(phase1-port): V4HCBlock.forward / hc_pre / hc_post need to land
+        before this works. Until then this raises with a clear message.
+        """
+        # Attention sublayer (mHC-wrapped)
+        residual = x
+        x_pre, post, comb = self.hc.hc_pre(x, self.hc.hc_attn_fn, self.hc.hc_attn_scale, self.hc.hc_attn_base)
+        x_pre = self._norm(x_pre, self.attn_norm_weight)
+        x_pre = self.attn(x_pre, start_pos)
+        x = self.hc.hc_post(x_pre, residual, post, comb)
+
+        # FFN sublayer (mHC-wrapped)
+        residual = x
+        x_pre, post, comb = self.hc.hc_pre(x, self.hc.hc_ffn_fn, self.hc.hc_ffn_scale, self.hc.hc_ffn_base)
+        x_pre = self._norm(x_pre, self.ffn_norm_weight)
+        x_pre = self.ffn(x_pre, input_ids)
+        x = self.hc.hc_post(x_pre, residual, post, comb)
+        return x
 
 
 # ============================================================================
