@@ -713,6 +713,225 @@ class V4Compressor(nn.Module):
 
 
 # ============================================================================
+# V4Indexer — learned-index topk for CSA layers (V4-specific, NEW code)
+# ============================================================================
+#
+# IMPORTANT (architecture-notes.md "Open risks #11"): the V3.2 NSA Indexer at
+# `sglang.srt.layers.attention.nsa.nsa_indexer.Indexer` is NOT a drop-in
+# replacement. V3.2 NSA's Indexer reads K from a regular `wk` projection
+# (one head per token from full KV); V4's Indexer has its OWN Compressor
+# (with Hadamard rotation + FP4 quant of Q/KV) and scores against the
+# Compressor's compressed KV. The two architectures are structurally
+# different.
+#
+# Direct port of V4 reference inference/model.py:Indexer (lines 380-433).
+# Used only on CSA layers (compress_ratio == 4); HCA layers use deterministic
+# stride via get_compress_topk_idxs.
+
+
+class V4Indexer(nn.Module):
+    """V4 learned-index topk selector for sparse attention.
+
+    Architecture (V4 reference inference/model.py:Indexer lines 380-433):
+      1. Q proj from low-rank q_lora: `wq_b: q_lora_rank -> n_heads * head_dim`
+      2. Apply rotary on the rope_head_dim slice + Hadamard rotation + FP4
+         quant on the full Q
+      3. Run an internal Compressor (with `rotate=True`) on the input x to
+         build the Indexer's compressed KV cache (separate from V4Attention's
+         KV cache; different head_dim, different rotation regime)
+      4. Compute index_score = einsum("bshd,btd->bsht", q, indexer.kv_cache)
+      5. Apply weights from `weights_proj(x)` (per-token, per-head bias) +
+         relu + sum over heads -> [B, S, T] per-token-pair score
+      6. Causal mask + topk selection -> [B, S, index_topk] indices into
+         the compressed KV (with offset added so they're absolute KV-cache
+         positions for the parent V4Attention's sparse_attn call)
+
+    Returns indices into the parent V4Attention's KV cache, NOT into the
+    Indexer's own KV cache. The `offset` parameter shifts the Indexer-local
+    indices into the parent's compressed-KV section (which sits after the
+    sliding window).
+
+    Differences from V4 reference (TODO markers inline):
+    - nn.Linear instead of V4 reference's parallel Linear (TODO(phase1-tp))
+    - Hadamard rotation + FP4 quant of Q are NO-OPs here pending sgl-kernel
+      implementation (TODO(phase1-quant)). The shape contract is unchanged
+      but numerical agreement requires the rotation + quant.
+    """
+
+    def __init__(self, layer_id: int, config: PretrainedConfig):
+        super().__init__()
+        self.layer_id = layer_id
+        self.dim = config.hidden_size
+        self.n_heads = config.index_n_heads
+        self.n_local_heads = self.n_heads  # TODO(phase1-tp): // world_size
+        self.head_dim = config.index_head_dim
+        self.rope_head_dim = getattr(config, "qk_rope_head_dim", 64)
+        self.index_topk = config.index_topk
+        self.q_lora_rank = config.q_lora_rank
+        self.softmax_scale = self.head_dim ** -0.5
+        self.compress_ratio = 4  # CSA layers always have compress_ratio=4
+
+        # Q projection from low-rank input.
+        # TODO(phase1-tp): ColumnParallelLinear instead of nn.Linear.
+        self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+
+        # Per-token, per-head weight bias for the index score.
+        # V4 reference uses BF16 dtype (line 394).
+        self.weights_proj = nn.Linear(
+            self.dim, self.n_heads, bias=False, dtype=torch.bfloat16
+        )
+
+        # Indexer's own Compressor — separate from the parent V4Attention's
+        # Compressor (different head_dim: index_head_dim=128 vs head_dim=512).
+        # rotate=True triggers the Hadamard + FP4 quant pre-FP4-GEMM (TODO).
+        self.compressor = V4Compressor(
+            hidden_size=self.dim,
+            head_dim=self.head_dim,
+            compress_ratio=self.compress_ratio,
+            rope_head_dim=self.rope_head_dim,
+            max_batch_size=getattr(config, "max_batch_size", 4),
+            norm_eps=config.rms_norm_eps,
+            rotate=True,  # CSA Indexer applies Hadamard rotation + FP4 quant
+        )
+
+        # Indexer's own KV cache (compressed, head_dim=index_head_dim).
+        # Lazy-wired in __init__ (V4 reference uses register_buffer here too).
+        max_seq_len = config.max_position_embeddings
+        max_batch_size = getattr(config, "max_batch_size", 4)
+        self.register_buffer(
+            "kv_cache",
+            torch.zeros(
+                max_batch_size,
+                max_seq_len // self.compress_ratio,
+                self.head_dim,
+            ),
+            persistent=False,
+        )
+
+        # freqs_cis assigned by parent V4Attention's first forward.
+        self.freqs_cis: Optional[torch.Tensor] = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        start_pos: int,
+        offset: int,
+    ) -> torch.Tensor:
+        """V4 Indexer forward. Direct port of V4 reference Indexer.forward
+        (lines 402-433).
+
+        Args:
+            x: [B, S, dim] input hidden states
+            qr: [B, S, q_lora_rank] q_norm output from parent V4Attention
+                (the post-q_norm q used for the indexer's own Q proj)
+            start_pos: token offset (0 = prefill)
+            offset: shift to add to the returned indices so they're absolute
+                positions in the parent V4Attention's KV cache (= sliding
+                window size when start_pos > 0; or kv.size(1) at prefill)
+
+        Returns:
+            topk_idxs: [B, S, index_topk] int indices into the parent
+                V4Attention's KV cache. -1 entries indicate masked positions.
+        """
+        assert self.freqs_cis is not None, (
+            "V4Indexer.forward called before parent V4Attention assigned freqs_cis"
+        )
+        bsz, seqlen, _ = x.size()
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        ratio = self.compress_ratio
+        rd = self.rope_head_dim
+        end_pos = start_pos + seqlen
+
+        # Lazy-wire compressor's kv_cache + freqs_cis on first call.
+        if self.compressor.kv_cache is None:
+            self.compressor.kv_cache = self.kv_cache
+            self.compressor.freqs_cis = self.freqs_cis
+
+        # Q projection.
+        q = self.wq_b(qr)
+        q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
+        # In-place rotary on the rope_head_dim slice.
+        apply_rotary_emb_v4(q[..., -rd:], freqs_cis)
+
+        # TODO(phase1-quant): rotate_activation(q) + fp4_act_quant(q)
+        # V4 reference applies Hadamard rotation + FP4 quantization to Q
+        # before the FP4 GEMM with FP4-quantized KV. Without these, the
+        # numerical output differs from V4 reference but the shape and
+        # algorithm structure are correct.
+
+        # Update the Indexer's own compressed KV cache.
+        self.compressor(x, start_pos, rotary_apply_fn=apply_rotary_emb_v4)
+
+        # Per-token, per-head weight bias.
+        # V4 reference: weights = weights_proj(x) * (softmax_scale * n_heads ** -0.5)
+        weights = self.weights_proj(x).float() * (
+            self.softmax_scale * self.n_heads ** -0.5
+        )
+
+        # Index score: einsum("bshd,btd->bsht", q, indexer.kv_cache).
+        # Then relu_() + multiply by per-head weights and sum over heads
+        # -> [B, S, T] per-token-pair score.
+        index_score = torch.einsum(
+            "bshd,btd->bsht",
+            q.float(),
+            self.kv_cache[:bsz, : end_pos // ratio].float(),
+        )
+        index_score = (F.relu(index_score) * weights.unsqueeze(-1)).sum(dim=2)
+
+        # TP all_reduce stub (world_size=1 -> noop). TODO(phase1-tp).
+        # if world_size > 1: dist.all_reduce(index_score)
+
+        # Causal mask: at prefill, mask future positions.
+        if start_pos == 0:
+            causal_mask = torch.arange(seqlen // ratio, device=x.device).repeat(
+                seqlen, 1
+            ) >= torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
+            index_score = index_score + torch.where(
+                causal_mask, float("-inf"), 0.0
+            )
+
+        # Top-k selection over the compressed-KV positions.
+        topk = min(self.index_topk, end_pos // ratio)
+        if topk == 0:
+            # Edge case: no compressed KV yet. Return all-(-1) with the
+            # full index_topk width so the caller can torch.cat without
+            # shape mismatch.
+            return torch.full(
+                (bsz, seqlen, self.index_topk),
+                -1,
+                dtype=torch.long,
+                device=x.device,
+            )
+        topk_idxs = index_score.topk(topk, dim=-1)[1]
+
+        # At prefill, mask out indices that point past the current query
+        # position (which would have been -inf above; they may still
+        # appear in the topk if all scores are -inf).
+        if start_pos == 0:
+            mask_invalid = topk_idxs >= torch.arange(
+                1, seqlen + 1, device=x.device
+            ).unsqueeze(1) // ratio
+            topk_idxs = torch.where(
+                mask_invalid, torch.full_like(topk_idxs, -1), topk_idxs + offset
+            )
+        else:
+            topk_idxs = topk_idxs + offset
+
+        # Pad to index_topk if the topk was smaller (early-prefill case).
+        if topk_idxs.shape[-1] < self.index_topk:
+            pad = torch.full(
+                (bsz, seqlen, self.index_topk - topk_idxs.shape[-1]),
+                -1,
+                dtype=topk_idxs.dtype,
+                device=topk_idxs.device,
+            )
+            topk_idxs = torch.cat([topk_idxs, pad], dim=-1)
+
+        return topk_idxs
+
+
+# ============================================================================
 # V4Attention — single class for all three attention modes (matches V4 reference)
 # ============================================================================
 #
@@ -825,11 +1044,16 @@ class V4Attention(nn.Module):
                 rotate=(self.compress_ratio == 4),  # CSA uses Hadamard rotation; HCA doesn't
             )
             if self.compress_ratio == 4:
-                # TODO(phase1-nsa): plug in sglang's V3.2 NSA Indexer here.
-                # `self.indexer = NSAIndexer(...)` once configured for V4 args.
-                self.indexer = None
+                # CSA path: V4-specific learned-index Indexer (NOT V3.2 NSA's
+                # Indexer — see V4Indexer docstring for the architectural
+                # difference). Hadamard rotation + FP4 quant of Q/KV inside
+                # the Indexer are TODO(phase1-quant); shape contract is
+                # correct, numerical agreement with V4 reference requires
+                # the rotation + quant kernels.
+                self.indexer = V4Indexer(layer_id, config)
             else:
-                # HCA: no learned Indexer, deterministic stride selection.
+                # HCA: no learned Indexer; uses deterministic stride
+                # selection via get_compress_topk_idxs in V4Attention.forward.
                 self.indexer = None
         else:
             self.compressor = None
