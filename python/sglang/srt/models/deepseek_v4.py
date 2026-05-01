@@ -1355,26 +1355,99 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
-    """DeepSeek-V4 inference entrypoint."""
+    """DeepSeek-V4 inference entrypoint.
+
+    Direct port of V4 reference Transformer (inference/model.py lines 769-809)
+    with Eagle3 aux-hidden-state capture grafted on per the qwen2.py:652
+    post-loop trap pattern (`wiki/pipeline.md` known-pitfall).
+
+    Per CLAUDE.md rule #12 + architecture-notes.md "Eagle3 vs native MTP",
+    the MTP block is loaded for weight-key compatibility but NOT executed
+    at Eagle3 inference time. The Eagle3 draft head replaces it.
+    """
 
     def __init__(self, config: PretrainedConfig, **kwargs):
         super().__init__()
         self.config = config
 
-        # Store Eagle3 capture config; populated by set_eagle3_layers_to_capture.
+        # Eagle3 capture config; populated by set_eagle3_layers_to_capture.
         self._eagle3_layers_to_capture: List[int] = []
         self._enable_return_hidden_states: bool = False
 
-        # TODO(phase1-port): build embed, layers, norm, lm_head
-        # self.embed = nn.Embedding(config.vocab_size, config.hidden_size, ...)
-        # self.layers = nn.ModuleList([
-        #     DeepseekV4DecoderLayer(i, config) for i in range(config.num_hidden_layers)
-        # ])
-        # self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        # self.lm_head = ...
-        # MTP block per config.num_nextn_predict_layers (default 1) — for Eagle3,
-        # we drop MTP at inference time; load weights but don't run them.
-        # logger.info(...)
+        # Embedding + main transformer trunk.
+        self.embed = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList(
+            [DeepseekV4DecoderLayer(i, config) for i in range(config.num_hidden_layers)]
+        )
+
+        # Final RMSNorm before head (V4 reference line 787).
+        self.final_norm_weight = nn.Parameter(
+            torch.ones(config.hidden_size, dtype=torch.float32)
+        )
+        self.norm_eps = config.rms_norm_eps
+
+        # Top-level mHC head reduction parameters (V4 reference lines 794-799).
+        # These fold the [b, s, hc_mult, d] hidden state into [b, s, d] before lm_head.
+        hc_mult = getattr(config, "hc_mult", 4)
+        self.hc_mult = hc_mult
+        hc_dim = hc_mult * config.hidden_size
+        self.hc_head_fn = nn.Parameter(torch.empty(hc_mult, hc_dim, dtype=torch.float32))
+        self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
+        self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
+        self.hc_eps = getattr(config, "hc_eps", 1e-6)
+
+        # LM head. V4 reference stores in fp32 for logit precision.
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # MTP blocks. Per rule #12, loaded but NOT run at Eagle3 inference;
+        # the Eagle3 draft head replaces them. Allocating the module list
+        # so the weight loader can write the MTP weight keys without error.
+        # TODO(phase1-port): MTPBlock body (mirrors DeepseekV4DecoderLayer +
+        # e_proj, h_proj, enorm, hnorm, head_fn/base/scale per V4 ref lines
+        # 738-766). Skipped tonight because we don't run MTP for Eagle3.
+        n_mtp = getattr(config, "num_nextn_predict_layers", 0)
+        if n_mtp > 0:
+            logger.info(
+                "DeepseekV4ForCausalLM: %d MTP block(s) detected in config "
+                "(num_nextn_predict_layers=%d). Per CLAUDE.md rule #12, MTP "
+                "is loaded for weight-key compat but NOT executed at Eagle3 "
+                "inference. The Eagle3 draft head replaces it.",
+                n_mtp,
+                n_mtp,
+            )
+            # Placeholder modules so weight loader has somewhere to write.
+            self.mtp = nn.ModuleList(
+                [nn.Identity() for _ in range(n_mtp)]
+            )
+        else:
+            self.mtp = nn.ModuleList()
+
+    # -----------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------
+
+    def _final_norm(self, x: torch.Tensor) -> torch.Tensor:
+        """Functional RMSNorm matching V4 reference."""
+        dtype = x.dtype
+        x32 = x.float()
+        var = x32.square().mean(-1, keepdim=True)
+        x32 = x32 * torch.rsqrt(var + self.norm_eps)
+        return (self.final_norm_weight * x32).to(dtype)
+
+    def _hc_head_fold(self, x: torch.Tensor) -> torch.Tensor:
+        """Fold [b, s, hc_mult, d] -> [b, s, d] via the top-level mHC head.
+
+        V4 reference ParallelHead.hc_head (lines 728-735). Differs from the
+        per-Block hc_pre: this one uses scalar `hc_head_scale` (not the 3-vector
+        scale used in Block.hc_pre) and only computes `pre` (no `post`/`comb`).
+        """
+        shape, dtype = x.size(), x.dtype
+        x_flat = x.flatten(2).float()
+        rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(x_flat, self.hc_head_fn) * rsqrt
+        pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        return y.to(dtype)
 
     def set_eagle3_layers_to_capture(self, layers_to_capture: List[int]) -> None:
         """Eagle3 hook: configure which transformer layer indices' aux hidden
@@ -1406,22 +1479,132 @@ class DeepseekV4ForCausalLM(nn.Module):
     def enable_return_hidden_states(self, value: bool) -> None:
         self._enable_return_hidden_states = bool(value)
 
-    def forward(self, input_ids: torch.Tensor, *args, **kwargs):
-        # TODO(phase1-port): full forward with embed -> hc-expand -> layers ->
-        # hc-head -> lm_head. Emit aux hidden states when
-        # self._enable_return_hidden_states is True, capturing on layers
-        # in self._eagle3_layers_to_capture (apply qwen2.py:652 post-loop trap
-        # for layer indices == num_hidden_layers - 1 if present).
-        raise NotImplementedError("DeepseekV4ForCausalLM.forward scaffold — see TODO(phase1-port)")
+    @torch.inference_mode()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        start_pos: int = 0,
+        positions: Optional[torch.Tensor] = None,
+        return_aux_hidden_states: Optional[bool] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
+        """V4 forward with optional Eagle3 aux-hidden-state capture.
+
+        Direct port of V4 reference Transformer.forward (lines 801-809) with
+        Eagle3 aux capture grafted on per the qwen2.py:652 post-loop trap
+        pattern.
+
+        Args:
+            input_ids: [B, T] token ids
+            start_pos: token offset into the KV cache (0 = prefill)
+            positions: unused (sglang interface compat); positions are derived
+                from `start_pos` and seqlen internally
+            return_aux_hidden_states: optional override of
+                `self._enable_return_hidden_states`. When True, returns
+                `(logits, aux_hidden_states_list)` instead of just `logits`.
+
+        Returns:
+            logits: [B, vocab_size] last-token logits (V4 reference takes
+                only the last token via `x[:, -1]` in get_logits).
+            (logits, aux_hs): when `return_aux_hidden_states` is True,
+                aux_hs is a list of [B, T, hidden_size] tensors, one per
+                layer index in `self._eagle3_layers_to_capture` (in the
+                same order as the configured indices).
+
+        Aux capture semantics:
+            For each layer index i in self._eagle3_layers_to_capture, the
+            aux tensor at that index is the layer's INPUT (i.e. the output
+            of layer i-1, or the embed-expanded hidden state for i=0). We
+            apply the qwen2.py:652 post-loop trap: when the configured
+            list contains an index equal to num_hidden_layers (the
+            "off-by-one for the final layer"), we capture the post-loop
+            hidden state too. Both get folded over the hc_mult dim by mean
+            so the per-layer aux feature dim is `hidden_size` (matching
+            Eagle3 draft model expectations: 3 layers x 4096 dim = 12288
+            aux feature dim for the V4-Flash slot triple [1, 21, 41]).
+        """
+        return_aux = (
+            return_aux_hidden_states
+            if return_aux_hidden_states is not None
+            else self._enable_return_hidden_states
+        )
+        capture_layers = set(self._eagle3_layers_to_capture) if return_aux else set()
+
+        # 1. Embed.
+        h = self.embed(input_ids)
+        # 2. Expand to hc_mult copies for Hyper-Connections (V4 ref line 805).
+        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+
+        aux_hidden_states: List[torch.Tensor] = []
+        end_layer = len(self.layers)
+
+        # 3. Layer loop with aux capture INSIDE the loop (qwen2.py pattern).
+        for i, layer in enumerate(self.layers):
+            if i in capture_layers:
+                # Capture the layer INPUT, mean over hc copies.
+                # Shape: [B, T, hc_mult, d].mean(dim=-2) -> [B, T, d]
+                aux_hidden_states.append(h.mean(dim=-2))
+            h = layer(h, start_pos, input_ids)
+
+        # 4. Post-loop trap: if end_layer (= num_hidden_layers) is in the
+        # configured capture set, capture the final layer's OUTPUT.
+        # set_eagle3_layers_to_capture sometimes maps indices [0, 14, 27]
+        # to [1, 15, 28] (+1 offset to capture each layer's output as the
+        # input to the next). For the last layer, that mapped index is
+        # num_hidden_layers and is unreachable inside the for-loop.
+        # Capture here, before the final norm + mHC fold, so the aux state
+        # matches the same pre-norm convention as the in-loop captures.
+        if end_layer in capture_layers:
+            aux_hidden_states.append(h.mean(dim=-2))
+
+        # 5. Top-level mHC head fold + final norm + lm_head.
+        h_folded = self._hc_head_fold(h)  # [B, T, hc_mult, d] -> [B, T, d]
+        h_normed = self._final_norm(h_folded)
+        # V4 reference uses `x[:, -1]` to take only the last token's logits.
+        # For sglang inference this matches the per-step generation pattern.
+        logits = self.lm_head(h_normed[:, -1].float())
+
+        if return_aux:
+            return logits, aux_hidden_states
+        return logits
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
-        """Adapt deepseek_common/deepseek_weight_loader for FP4-aware loading.
+        """Load V4-Flash weights from the HF checkpoint into this model.
 
-        TODO(phase1-port): need to handle FP4 (`torch.float4_e2m1fn_x2`) expert
-        weight tensors with their E8M0 scales. The V3.2 weight loader is
-        BF16/FP8 aware but not FP4.
+        TODO(phase1-loader): full body. The weight loader needs to:
+
+        1. Map HF checkpoint keys to our parameter names. V4 uses
+           `model.layers.<i>.{self_attn,mlp}.{wq_a,wq_b,wkv,wo_a,wo_b,...}`
+           in its checkpoint; our names use a similar but not identical
+           layout. Build the key map by inspecting `/tmp/v4-flash-meta/
+           model.safetensors.index.json` and the V4 reference inference/
+           convert.py.
+
+        2. Handle FP4 expert weight dequantization. V4 stores expert weights
+           in FP4 (`torch.float4_e2m1fn_x2`) with E8M0 scales. Our V4Expert
+           uses nn.Linear (BF16 storage); the loader must dequantize FP4 -> BF16
+           on load using the kernel.py:fp4_gemm logic. This is slow + memory-
+           heavy at runtime but functionally correct. TODO(phase1-fp4) is to
+           swap V4Expert to a V4-aware FP4 Linear that keeps weights packed.
+
+        3. Handle FP8 non-expert weights similarly (e4m3fn with e8m0fnu scales).
+           Sglang already has an FP8 weight loader path
+           (sglang.srt.layers.quantization.fp8_kernel); reuse where possible.
+
+        4. Handle the hash-routing tid2eid table (int32, no quant).
+
+        5. Handle the MTP block weights — load them but don't run them
+           (per CLAUDE.md rule #12). With `self.mtp = ModuleList(Identity)`
+           the loader can write them to a flat parameter dict and they're
+           ignored at forward time.
+
+        Reference: deepseek_common/deepseek_weight_loader.py for the V3.2
+        loader; the pattern carries over with FP4 modifications.
         """
-        raise NotImplementedError("DeepseekV4ForCausalLM.load_weights scaffold — see TODO(phase1-port)")
+        raise NotImplementedError(
+            "DeepseekV4ForCausalLM.load_weights — see TODO(phase1-loader). "
+            "Until this lands, instantiate the model with random weights "
+            "for shape testing only."
+        )
 
 
 # ============================================================================
