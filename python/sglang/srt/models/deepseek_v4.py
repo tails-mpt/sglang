@@ -2072,6 +2072,149 @@ class DeepseekV4ForCausalLM(nn.Module):
 
 
 # ============================================================================
+# Weight-key remap helper for load_weights
+# ============================================================================
+#
+# Maps HF checkpoint keys (V4 inference reference's parameter naming) to our
+# parameter names. Three classes of remap:
+#
+#   1. Top-level rename: head.weight -> lm_head.weight
+#   2. RMSNorm submodule -> Parameter:
+#        <prefix>.q_norm.weight -> <prefix>.q_norm_weight
+#        (similarly: kv_norm, attn_norm, ffn_norm, compressor.norm,
+#         enorm, hnorm — see DeepseekV4ForCausalLM.load_weights docstring)
+#   3. mHC params flat -> .hc submodule:
+#        layers.<i>.hc_<x>_<y> -> layers.<i>.hc.hc_<x>_<y>
+#        (where <x> in {attn, ffn} and <y> in {fn, base, scale})
+#
+# Does NOT handle:
+#   - FP4 / FP8 dequant (separate pass; needs torch CUDA + e2m1fn_x2 dtype)
+#   - MTP key split (separate pass; trivial filter on key.startswith("mtp."))
+#
+# The 4 test stubs in test/manual/models/test_deepseek_v4_models.py drive
+# the contract for this helper. Once this lands, those tests can have
+# their pytest.mark.skip removed.
+
+
+# Per-layer norms that the V4 checkpoint stores as RMSNorm submodules with
+# .weight, but our model stores as flat Parameters with name "..._weight".
+# Listed without the "<prefix>." part.
+_V4_NORM_REMAPS = (
+    "q_norm",
+    "kv_norm",
+    "attn_norm",
+    "ffn_norm",
+    "enorm",
+    "hnorm",
+    # Note: compressor.norm is handled separately because the prefix has a
+    # `.compressor.` segment.
+)
+
+# mHC param suffixes flat at the layer level in the checkpoint. Move under
+# `.hc.` submodule.
+_V4_MHC_SUFFIXES = (
+    "hc_attn_fn",
+    "hc_attn_base",
+    "hc_attn_scale",
+    "hc_ffn_fn",
+    "hc_ffn_base",
+    "hc_ffn_scale",
+)
+
+
+def _remap_v4_checkpoint_keys(
+    state_dict: Dict[str, torch.Tensor],
+    config: Optional[Any] = None,
+) -> Dict[str, torch.Tensor]:
+    """Translate V4 HF checkpoint key naming to our model parameter naming.
+
+    Args:
+        state_dict: Dict of {key: tensor} from the V4 HF checkpoint. Keys
+            follow V4 inference reference's parameter naming (e.g.
+            `embed.weight`, `head.weight`, `layers.0.attn.q_norm.weight`,
+            `layers.0.hc_attn_fn`, `layers.0.attn.compressor.norm.weight`).
+        config: Optional. Currently unused but accepted for forward compat
+            (the helper's contract may need config-aware decisions in the
+            future, e.g. for MTP layer count when splitting MTP keys).
+
+    Returns:
+        Dict with the same tensors but keys renamed to match our model's
+        parameter names. Total key count is preserved (every input key
+        produces exactly one output key).
+
+    Does NOT modify the input dict. Returns a new dict.
+    """
+    out: Dict[str, torch.Tensor] = {}
+
+    for key, tensor in state_dict.items():
+        new_key = _remap_one_v4_key(key)
+        out[new_key] = tensor
+
+    return out
+
+
+def _remap_one_v4_key(key: str) -> str:
+    """Apply remap to a single key. Returns the new key (or the input
+    unchanged if no remap applies)."""
+
+    # 1. Top-level renames.
+    if key == "head.weight":
+        return "lm_head.weight"
+
+    # 2. mHC flat params -> .hc submodule.
+    # Pattern: layers.<i>.hc_<x>_<y>  (or mtp.<i>.hc_<x>_<y>)
+    for suffix in _V4_MHC_SUFFIXES:
+        token = "." + suffix
+        # Match the suffix at the very end of the key (e.g. layers.5.hc_attn_fn)
+        # to avoid clobbering deeper paths.
+        if key.endswith(token):
+            prefix = key[: -len(token)]
+            # The prefix must look like layers.<digit>+ or mtp.<digit>+.
+            # If it has any deeper path, we've already remapped in some
+            # other pass and shouldn't double-remap.
+            if _is_top_level_layer_or_mtp(prefix):
+                return f"{prefix}.hc.{suffix}"
+
+    # 3. RMSNorm submodule .weight -> Parameter <name>_weight.
+    #    Pattern: <prefix>.<norm_name>.weight  ->  <prefix>.<norm_name>_weight
+    for norm in _V4_NORM_REMAPS:
+        token = f".{norm}.weight"
+        if key.endswith(token):
+            prefix = key[: -len(token)]
+            return f"{prefix}.{norm}_weight"
+
+    # Special case: compressor.norm.weight (deeper path than the simple
+    # "<prefix>.<norm>.weight" pattern would catch — the norm is INSIDE
+    # the compressor submodule).
+    if key.endswith(".compressor.norm.weight"):
+        prefix = key[: -len(".compressor.norm.weight")]
+        return f"{prefix}.compressor.norm_weight"
+
+    # 4. Pass through unchanged.
+    return key
+
+
+def _is_top_level_layer_or_mtp(prefix: str) -> bool:
+    """Return True if `prefix` matches `layers.<i>` or `mtp.<i>` exactly,
+    where <i> is one or more digits. Used by the mHC remap to avoid
+    matching deeper paths that happen to end in "hc_..." substrings.
+
+    Examples:
+        "layers.5"       -> True
+        "mtp.0"          -> True
+        "layers.5.attn"  -> False
+        "embed"          -> False
+        ""               -> False
+    """
+    parts = prefix.split(".")
+    if len(parts) != 2:
+        return False
+    if parts[0] not in ("layers", "mtp"):
+        return False
+    return parts[1].isdigit()
+
+
+# ============================================================================
 # Module-level export — explicit so the registry's pkgutil walk picks it up
 # ============================================================================
 

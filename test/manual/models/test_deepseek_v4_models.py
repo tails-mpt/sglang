@@ -475,7 +475,6 @@ def _make_synthetic_v4_checkpoint_subset(num_layers=4, n_routed_experts=8):
     return sd
 
 
-@pytest.mark.skip(reason="Requires _remap_v4_checkpoint_keys helper in deepseek_v4.py (TODO(phase1-loader))")
 def test_remap_top_level_keys():
     """Top-level renames: head.weight -> lm_head.weight (etc)."""
     from sglang.srt.models.deepseek_v4 import _remap_v4_checkpoint_keys  # noqa: F401
@@ -491,7 +490,6 @@ def test_remap_top_level_keys():
     assert "hc_head_fn" in sd_out
 
 
-@pytest.mark.skip(reason="Requires _remap_v4_checkpoint_keys helper in deepseek_v4.py (TODO(phase1-loader))")
 def test_remap_per_layer_norms():
     """Per-layer norms: <prefix>.norm.weight -> <prefix>.norm_weight."""
     from sglang.srt.models.deepseek_v4 import _remap_v4_checkpoint_keys
@@ -512,7 +510,6 @@ def test_remap_per_layer_norms():
         assert f"layers.{i}.ffn_norm_weight" in sd_out
 
 
-@pytest.mark.skip(reason="Requires _remap_v4_checkpoint_keys helper in deepseek_v4.py (TODO(phase1-loader))")
 def test_remap_mhc_to_submodule():
     """mHC params move from flat layer level to V4HCBlock submodule."""
     from sglang.srt.models.deepseek_v4 import _remap_v4_checkpoint_keys
@@ -530,7 +527,6 @@ def test_remap_mhc_to_submodule():
                 assert new in sd_out, f"new key {new} missing"
 
 
-@pytest.mark.skip(reason="Requires _remap_v4_checkpoint_keys helper in deepseek_v4.py (TODO(phase1-loader))")
 def test_remap_pass_through_for_unrenamed_keys():
     """Keys that don't need remap pass through unchanged."""
     from sglang.srt.models.deepseek_v4 import _remap_v4_checkpoint_keys
