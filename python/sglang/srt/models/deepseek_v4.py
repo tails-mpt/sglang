@@ -224,6 +224,76 @@ def get_compress_topk_idxs(
     return matrix.unsqueeze(0).expand(bsz, -1, -1)
 
 
+def hc_split_sinkhorn_v4(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure-PyTorch port of V4 reference `hc_split_sinkhorn` (kernel.py
+    lines 372-438).
+
+    Splits the `mixes` tensor of shape `[..., (2+hc)*hc]` into three pieces:
+      pre  = sigmoid(mixes[..., :hc] * scale[0] + base[:hc]) + eps        -> [..., hc]
+      post = 2 * sigmoid(mixes[..., hc:2*hc] * scale[1] + base[hc:2*hc])  -> [..., hc]
+      comb = Sinkhorn-normalized matrix from mixes[..., 2*hc:]            -> [..., hc, hc]
+
+    Sinkhorn algorithm (matches the kernel exactly):
+      1. comb_logits = mixes[..., 2*hc:].reshape(..., hc, hc) * scale[2] + base[2*hc:].reshape(hc, hc)
+      2. comb = softmax(comb_logits, dim=-1) + eps
+      3. comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+      4. Repeat (sinkhorn_iters - 1) times:
+            comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+            comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+
+    TODO(phase1-kernel): port to a tilelang kernel matching the V4 reference
+    `hc_split_sinkhorn_kernel` in /tmp/v4-flash-meta/inference/kernel.py.
+    The pure-PyTorch impl here is correct but slower; the kernel runs the
+    Sinkhorn loop entirely on-chip with `T.alloc_fragment` storage. Add to
+    sgl-kernel/csrc/ alongside the FP4 GEMM kernel.
+
+    Args:
+        mixes: [..., (2+hc_mult)*hc_mult] FP32
+        hc_scale: [3] FP32 — broadcast scale for pre/post/comb logits
+        hc_base: [(2+hc_mult)*hc_mult] FP32 — additive bias
+        hc_mult: number of HC copies (V4-Flash uses 4)
+        sinkhorn_iters: total Sinkhorn iterations (V4-Flash uses 20)
+        eps: numerical stability
+
+    Returns:
+        (pre, post, comb) with shapes:
+            pre: [..., hc_mult]
+            post: [..., hc_mult]
+            comb: [..., hc_mult, hc_mult]
+    """
+    hc = hc_mult
+    leading_shape = mixes.shape[:-1]
+
+    # Slice and apply scale + base.
+    pre_logits = mixes[..., :hc] * hc_scale[0] + hc_base[:hc]
+    post_logits = mixes[..., hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc]
+    comb_logits = (
+        mixes[..., 2 * hc :].reshape(*leading_shape, hc, hc) * hc_scale[2]
+        + hc_base[2 * hc :].reshape(hc, hc)
+    )
+
+    pre = torch.sigmoid(pre_logits) + eps
+    post = 2 * torch.sigmoid(post_logits)
+
+    # Initial: row-softmax + eps, then divide column sums.
+    comb = F.softmax(comb_logits, dim=-1) + eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+
+    # Subsequent (sinkhorn_iters - 1) iterations: alternate row/col normalization.
+    for _ in range(sinkhorn_iters - 1):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+
+    return pre, post, comb
+
+
 def sparse_attn_v4(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -839,32 +909,127 @@ class WindowOnlyAttention(V4Attention):
 
 
 class V4HCBlock(nn.Module):
-    """mHC residual-stream wrapping for a transformer block.
+    """mHC (Manifold-Constrained Hyper-Connections) residual-stream wrapping.
 
-    V4-specific. NOT in V3.2 / V3 / V2. Maintains hc_mult=4 copies of the
-    hidden state and mixes via Sinkhorn-normalized weights (hc_split_sinkhorn).
+    V4-specific NEW code. NOT in V3.2 / V3 / V2. Maintains `hc_mult=4` copies
+    of the hidden state per token and mixes them via Sinkhorn-normalized
+    weights computed by `hc_split_sinkhorn_v4`.
 
-    The wrapping is per-sublayer: hc_pre folds 4 copies -> 1 input for
-    the sublayer, runs the sublayer (attn or ffn), then hc_post expands 1
-    -> 4 copies for the next sublayer.
+    Per-sublayer wrapping (called twice per Block, once for attn, once for ffn):
+      hc_pre: folds 4 copies -> 1 input. Returns (y, post, comb) where:
+              y    = sum_i pre[i] * x[i]                 [b, s, d]
+              post = sigmoid-derived per-copy weights    [b, s, hc]
+              comb = Sinkhorn-doubly-stochastic mixer    [b, s, hc, hc]
+      hc_post: expands 1 -> 4 copies for the next sublayer.
+              y[i] = post[i] * x + sum_j comb[i,j] * residual[j]
 
-    TODO(phase1-port): port from V4 reference inference/model.py:Block
-    lines 647-700 (hc_pre + hc_post + the dispatch in forward()).
+    Direct port of V4 reference `Block` (inference/model.py lines 647-700).
+    The V4 reference packs attn + ffn + their hc parameters into a single
+    `Block` class; our scaffold splits the hc parameters into `V4HCBlock` and
+    keeps attn / ffn on `DeepseekV4DecoderLayer`. Functionally identical.
 
-    TODO(phase1-kernel): write hc_split_sinkhorn kernel — V4 reference uses
-    a triton kernel, ~150 lines in inference/kernel.py. Port to
-    sgl-kernel/csrc/ with FlashInfer-style packaging.
+    Parameter shapes (V4 reference lines 660-671, all FP32):
+      hc_attn_fn, hc_ffn_fn:  [(2+hc_mult)*hc_mult, hc_mult*hidden_size]
+      hc_attn_base, hc_ffn_base: [(2+hc_mult)*hc_mult]
+      hc_attn_scale, hc_ffn_scale: [3]
     """
 
-    def __init__(self, hidden_size: int, hc_mult: int = 4, hc_sinkhorn_iters: int = 20, hc_eps: float = 1e-6):
+    def __init__(
+        self,
+        hidden_size: int,
+        hc_mult: int = 4,
+        hc_sinkhorn_iters: int = 20,
+        hc_eps: float = 1e-6,
+    ):
         super().__init__()
         self.hidden_size = hidden_size
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps
-        # TODO(phase1-port): allocate hc_attn_fn, hc_ffn_fn, hc_attn_base,
-        # hc_ffn_base, hc_attn_scale, hc_ffn_scale parameters per V4 reference.
-        raise NotImplementedError("V4HCBlock scaffold — see TODO(phase1-port + phase1-kernel)")
+
+        mix_hc = (2 + hc_mult) * hc_mult  # = 24 for hc_mult=4
+        hc_dim = hc_mult * hidden_size
+
+        # All HC parameters are FP32 (V4 reference uses set_dtype(torch.float32)
+        # context manager around the parameter allocation).
+        self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
+        self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
+        self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+        self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+        self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+
+    def hc_pre(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fold hc_mult copies into 1 weighted-sum input for the sublayer.
+
+        Direct port of V4 reference Block.hc_pre (lines 673-681).
+
+        Args:
+            x: [b, s, hc_mult, d] hidden state with hc_mult copies per token
+            hc_fn: [mix_hc, hc_mult*d] linear projection to the mixes vector
+            hc_scale: [3] additional scale on the three Sinkhorn input groups
+            hc_base: [mix_hc] additive bias on the mixes
+
+        Returns:
+            (y, post, comb):
+                y: [b, s, d] folded input for the sublayer
+                post: [b, s, hc_mult] post-weights for hc_post
+                comb: [b, s, hc_mult, hc_mult] combination matrix for hc_post
+        """
+        shape, dtype = x.size(), x.dtype
+        # Flatten the hc_mult copies into a single feature dim (b, s, hc*d), fp32.
+        x_flat = x.flatten(2).float()
+        # Per-token RMS scale (V4 reference line 677).
+        rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + self.hc_eps)
+        mixes = F.linear(x_flat, hc_fn) * rsqrt
+        pre, post, comb = hc_split_sinkhorn_v4(
+            mixes,
+            hc_scale,
+            hc_base,
+            self.hc_mult,
+            self.hc_sinkhorn_iters,
+            self.hc_eps,
+        )
+        # y = sum over hc copies, weighted by pre.
+        # x.view(shape) is [b, s, hc_mult, d]. pre.unsqueeze(-1) is [b, s, hc_mult, 1].
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        return y.to(dtype), post, comb
+
+    def hc_post(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Expand the sublayer output back to hc_mult copies.
+
+        Direct port of V4 reference Block.hc_post (lines 683-686).
+
+        Args:
+            x: [b, s, d] sublayer output
+            residual: [b, s, hc_mult, d] pre-sublayer hidden state (hc copies)
+            post: [b, s, hc_mult] from hc_pre
+            comb: [b, s, hc_mult, hc_mult] from hc_pre
+
+        Returns:
+            y: [b, s, hc_mult, d] post-sublayer hidden state with hc copies
+        """
+        # post.unsqueeze(-1):                [b, s, hc_mult, 1]
+        # x.unsqueeze(-2):                   [b, s, 1, d]
+        # comb.unsqueeze(-1):                [b, s, hc_mult, hc_mult, 1]
+        # residual.unsqueeze(-2):            [b, s, 1, hc_mult, d]
+        # comb * residual sums over hc_mult: [b, s, hc_mult, d]
+        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(
+            comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2
+        )
+        return y.type_as(x)
 
 
 # ============================================================================
