@@ -1670,38 +1670,178 @@ class DeepseekV4ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         """Load V4-Flash weights from the HF checkpoint into this model.
 
-        TODO(phase1-loader): full body. The weight loader needs to:
+        TODO(phase1-loader): full body. The HF checkpoint key naming was
+        derived from /tmp/v4-flash-meta/model.safetensors.index.json
+        (5.4 MB, 69187 keys, 82 distinct patterns) on 2026-04-30. The
+        V4 checkpoint uses the V4 inference reference's parameter naming
+        (NOT HF's `model.layers.<N>.self_attn.*` convention) — keys live
+        flat at `embed.weight`, `head.weight`, `layers.<i>.attn.*`,
+        `layers.<i>.ffn.*`, `mtp.<i>.*`, etc.
 
-        1. Map HF checkpoint keys to our parameter names. V4 uses
-           `model.layers.<i>.{self_attn,mlp}.{wq_a,wq_b,wkv,wo_a,wo_b,...}`
-           in its checkpoint; our names use a similar but not identical
-           layout. Build the key map by inspecting `/tmp/v4-flash-meta/
-           model.safetensors.index.json` and the V4 reference inference/
-           convert.py.
+        ============================================================
+        Distilled HF checkpoint key -> our parameter map
+        ============================================================
 
-        2. Handle FP4 expert weight dequantization. V4 stores expert weights
-           in FP4 (`torch.float4_e2m1fn_x2`) with E8M0 scales. Our V4Expert
-           uses nn.Linear (BF16 storage); the loader must dequantize FP4 -> BF16
-           on load using the kernel.py:fp4_gemm logic. This is slow + memory-
-           heavy at runtime but functionally correct. TODO(phase1-fp4) is to
-           swap V4Expert to a V4-aware FP4 Linear that keeps weights packed.
+        Top-level:
+            embed.weight                            self.embed.weight
+            head.weight                             self.lm_head.weight  ← rename
+            hc_head_fn                              self.hc_head_fn
+            hc_head_base                            self.hc_head_base
+            hc_head_scale                           self.hc_head_scale
 
-        3. Handle FP8 non-expert weights similarly (e4m3fn with e8m0fnu scales).
-           Sglang already has an FP8 weight loader path
-           (sglang.srt.layers.quantization.fp8_kernel); reuse where possible.
+        Per main layer i (0..num_hidden_layers-1 = 0..42):
+            layers.<i>.attn.attn_sink               layers[i].attn.attn_sink
+            layers.<i>.attn.q_norm.weight           layers[i].attn.q_norm_weight  *
+            layers.<i>.attn.kv_norm.weight          layers[i].attn.kv_norm_weight *
+            layers.<i>.attn.wq_a.{weight,scale}     layers[i].attn.wq_a.{weight,scale}  **
+            layers.<i>.attn.wq_b.{weight,scale}     layers[i].attn.wq_b.{weight,scale}  **
+            layers.<i>.attn.wkv.{weight,scale}      layers[i].attn.wkv.{weight,scale}   **
+            layers.<i>.attn.wo_a.{weight,scale}     layers[i].attn.wo_a.{weight,scale}  **
+            layers.<i>.attn.wo_b.{weight,scale}     layers[i].attn.wo_b.{weight,scale}  **
+            (CSA + HCA layers only; window-only layers have no compressor:)
+            layers.<i>.attn.compressor.ape          layers[i].attn.compressor.ape
+            layers.<i>.attn.compressor.wkv.weight   layers[i].attn.compressor.wkv.weight
+            layers.<i>.attn.compressor.wgate.weight layers[i].attn.compressor.wgate.weight
+            layers.<i>.attn.compressor.norm.weight  layers[i].attn.compressor.norm_weight  *
+            (CSA layers only — Indexer:)
+            layers.<i>.attn.indexer.compressor.{ape,wkv.weight,wgate.weight,norm.weight}
+                                                    layers[i].attn.indexer.compressor.*
+                                                    (TODO(phase1-nsa): self.indexer is
+                                                     currently None; load these into
+                                                     a side dict for now)
+            layers.<i>.attn.indexer.weights_proj.weight
+                                                    layers[i].attn.indexer.weights_proj.weight
+            layers.<i>.attn.indexer.wq_b.{weight,scale}
+                                                    layers[i].attn.indexer.wq_b.{weight,scale}
+            (Per-layer norms + ffn:)
+            layers.<i>.attn_norm.weight             layers[i].attn_norm_weight  *
+            layers.<i>.ffn_norm.weight              layers[i].ffn_norm_weight   *
+            layers.<i>.ffn.gate.weight              layers[i].ffn.gate.weight
+            layers.<i>.ffn.gate.bias                layers[i].ffn.gate.bias  (score layers, i>=num_hash_layers=3)
+            layers.<i>.ffn.gate.tid2eid             layers[i].ffn.gate.tid2eid (hash layers, i<3)
+            layers.<i>.ffn.experts.<j>.w{1,2,3}.{weight,scale}
+                                                    layers[i].ffn.experts[j].w{1,2,3}.{weight,scale}
+                                                    (FP4 e2m1fn_x2 weight + e8m0fnu scale)
+            layers.<i>.ffn.shared_experts.w{1,2,3}.{weight,scale}
+                                                    layers[i].ffn.shared_experts.w{1,2,3}.{weight,scale}
+                                                    (FP8 e4m3fn weight + e8m0fnu scale)
+            (mHC params — flat at the layer in the checkpoint, but our
+             code wraps them in a V4HCBlock submodule:)
+            layers.<i>.hc_attn_fn                   layers[i].hc.hc_attn_fn  ***
+            layers.<i>.hc_attn_base                 layers[i].hc.hc_attn_base ***
+            layers.<i>.hc_attn_scale                layers[i].hc.hc_attn_scale ***
+            layers.<i>.hc_ffn_fn                    layers[i].hc.hc_ffn_fn   ***
+            layers.<i>.hc_ffn_base                  layers[i].hc.hc_ffn_base ***
+            layers.<i>.hc_ffn_scale                 layers[i].hc.hc_ffn_scale ***
 
-        4. Handle the hash-routing tid2eid table (int32, no quant).
+        MTP layer (mtp.<i>.*, i=0..num_nextn_predict_layers-1):
+            mtp.<i>.attn.*                          (subset of layer attn keys)
+            mtp.<i>.ffn.*                           (subset of layer ffn keys)
+            mtp.<i>.attn_norm.weight                (RMSNorm submodule)
+            mtp.<i>.ffn_norm.weight                 (RMSNorm submodule)
+            mtp.<i>.e_proj.{weight,scale}           (FP8)
+            mtp.<i>.h_proj.{weight,scale}           (FP8)
+            mtp.<i>.enorm.weight                    (RMSNorm submodule)
+            mtp.<i>.hnorm.weight                    (RMSNorm submodule)
+            mtp.<i>.hc_*                            (mtp-block-level mHC; same as layer)
+            mtp.<i>.hc_head_*                       (mtp-head-level mHC head)
+            (Per CLAUDE.md rule #12: load weights but do NOT run MTP; the
+             Eagle3 draft head replaces MTP at inference. Currently
+             self.mtp is ModuleList(nn.Identity); the loader writes weights
+             to a side dict and they're ignored at forward time.)
 
-        5. Handle the MTP block weights — load them but don't run them
-           (per CLAUDE.md rule #12). With `self.mtp = ModuleList(Identity)`
-           the loader can write them to a flat parameter dict and they're
-           ignored at forward time.
+        ============================================================
+        Annotation legend
+        ============================================================
+
+        *   Current code uses a Parameter named e.g. `q_norm_weight`;
+            checkpoint expects `q_norm.weight` (RMSNorm submodule with
+            `.weight`). Two paths to fix:
+            (a) refactor model to use sglang.srt.layers.layernorm.RMSNorm
+                submodules with `.weight` (preferred — matches checkpoint
+                key naming directly + reuses sglang's CUDA RMSNorm kernel);
+            (b) write a key remap in this loader: `.q_norm_weight` <->
+                `.q_norm.weight`. Same applies for kv_norm_weight,
+                attn_norm_weight, ffn_norm_weight, compressor.norm_weight,
+                enorm_weight, hnorm_weight (MTP).
+
+        **  Checkpoint stores quantized weight + separate scale tensor.
+            Three flavors:
+            - FP8 e4m3fn weight + e8m0fnu scale (128x128 weight blocks):
+              wq_a, wq_b, wkv, wo_a, wo_b, e_proj, h_proj, all attn/mtp
+              quantized linears.
+            - FP4 e2m1fn_x2 weight + e8m0fnu scale (1x32 along K):
+              ffn.experts.<j>.w{1,2,3}.
+            - FP8 + e8m0fnu (same as first): ffn.shared_experts.w{1,2,3},
+              ffn.gate.weight (router projection).
+            Two paths to fix:
+            (a) refactor V4Attention/V4Expert/etc to use sglang's
+                FP8/FP4-aware Linear classes that keep quantized storage
+                + use the sglang FP8/FP4 GEMM kernels (preferred — gets
+                perf, matches checkpoint key naming directly).
+            (b) loader dequantizes weight*scale -> BF16 on load and
+                discards the .scale (slow + memory-heavy at runtime but
+                functionally correct, ~3x memory blowup on experts).
+
+        *** Checkpoint stores mHC params flat at the layer level (e.g.
+            `layers.0.hc_attn_fn`). Current code wraps them in V4HCBlock
+            submodule so the parameter name is `layers[0].hc.hc_attn_fn`.
+            Loader needs to remap `layers.<i>.hc_attn_fn` <->
+            `layers[<i>].hc.hc_attn_fn` (and same for hc_attn_base,
+            hc_attn_scale, hc_ffn_*).
+
+        ============================================================
+        Implementation outline (to write on a GPU VM)
+        ============================================================
+
+            def load_weights(self, weights):
+                state_dict = dict(weights)
+
+                # Phase 1: top-level renames (head.weight -> lm_head.weight).
+                state_dict = self._remap_top_level_keys(state_dict)
+
+                # Phase 2: per-layer remap.
+                #  - <prefix>q_norm.weight -> <prefix>q_norm_weight
+                #    (similarly kv_norm, attn_norm, ffn_norm, compressor.norm,
+                #     enorm, hnorm) — see annotation *
+                #  - layers.<i>.hc_attn_fn -> layers[<i>].hc.hc_attn_fn — see ***
+                state_dict = self._remap_layer_keys(state_dict)
+
+                # Phase 3: split MTP keys into a side dict so the base
+                # nn.Module.load_state_dict doesn't error on unexpected keys.
+                # (Could also assign to self.mtp[i] placeholders if we want
+                # them visible for HF compat.)
+                state_dict, mtp_dict = self._split_mtp_keys(state_dict)
+
+                # Phase 4: FP8 / FP4 dequant for non-FP-aware Linear.
+                # Skip if/when V4-aware Linear is wired (TODO(phase1-fp4)).
+                state_dict = self._dequantize_fp8_fp4(state_dict)
+
+                # Phase 5: actual load.
+                missing, unexpected = self.load_state_dict(
+                    state_dict, strict=False
+                )
+                if missing or unexpected:
+                    logger.warning(
+                        "V4 weight load: missing=%d unexpected=%d. "
+                        "First 5 missing: %s. First 5 unexpected: %s.",
+                        len(missing), len(unexpected),
+                        list(missing)[:5], list(unexpected)[:5],
+                    )
 
         Reference: deepseek_common/deepseek_weight_loader.py for the V3.2
-        loader; the pattern carries over with FP4 modifications.
+        FP8 loader; pattern carries over with FP4 + V4-key-remap additions.
+        Counts of HF checkpoint keys (from index.json):
+          embed/head/hc_head: 5
+          per main layer (43 layers): ~1500 keys average (varies by layer
+            type — window-only ~80, CSA ~120, HCA ~110)
+          MTP layer (1): ~120 keys
+          Total: 69187 keys (most are expert weights — 256 experts × 43
+            layers × 3 weights × 2 (weight+scale) = 66048 expert keys)
         """
         raise NotImplementedError(
-            "DeepseekV4ForCausalLM.load_weights — see TODO(phase1-loader). "
+            "DeepseekV4ForCausalLM.load_weights — see TODO(phase1-loader) docstring "
+            "above for the full HF checkpoint -> model parameter mapping table. "
             "Until this lands, instantiate the model with random weights "
             "for shape testing only."
         )
