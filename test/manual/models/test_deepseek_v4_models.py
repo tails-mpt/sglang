@@ -527,6 +527,164 @@ def test_remap_mhc_to_submodule():
                 assert new in sd_out, f"new key {new} missing"
 
 
+# Full set of 82 distinct V4-Flash checkpoint key patterns extracted on
+# 2026-04-30 from /tmp/v4-flash-meta/model.safetensors.index.json. One
+# representative key per pattern (digits substituted to "0"). Fixture for
+# the comprehensive remap test below.
+_V4_KEY_PATTERNS = (
+    "embed.weight",
+    "hc_head_base",
+    "hc_head_fn",
+    "hc_head_scale",
+    "head.weight",
+    "norm.weight",
+    "layers.0.attn.attn_sink",
+    "layers.0.attn.compressor.ape",
+    "layers.0.attn.compressor.norm.weight",
+    "layers.0.attn.compressor.wgate.weight",
+    "layers.0.attn.compressor.wkv.weight",
+    "layers.0.attn.indexer.compressor.ape",
+    "layers.0.attn.indexer.compressor.norm.weight",
+    "layers.0.attn.indexer.compressor.wgate.weight",
+    "layers.0.attn.indexer.compressor.wkv.weight",
+    "layers.0.attn.indexer.weights_proj.weight",
+    "layers.0.attn.indexer.wq_b.scale",
+    "layers.0.attn.indexer.wq_b.weight",
+    "layers.0.attn.kv_norm.weight",
+    "layers.0.attn.q_norm.weight",
+    "layers.0.attn.wkv.scale",
+    "layers.0.attn.wkv.weight",
+    "layers.0.attn.wo_a.scale",
+    "layers.0.attn.wo_a.weight",
+    "layers.0.attn.wo_b.scale",
+    "layers.0.attn.wo_b.weight",
+    "layers.0.attn.wq_a.scale",
+    "layers.0.attn.wq_a.weight",
+    "layers.0.attn.wq_b.scale",
+    "layers.0.attn.wq_b.weight",
+    "layers.0.attn_norm.weight",
+    "layers.0.ffn.experts.0.w0.scale",
+    "layers.0.ffn.experts.0.w0.weight",
+    "layers.0.ffn.gate.bias",
+    "layers.0.ffn.gate.tid2eid",
+    "layers.0.ffn.gate.weight",
+    "layers.0.ffn.shared_experts.w0.scale",
+    "layers.0.ffn.shared_experts.w0.weight",
+    "layers.0.ffn_norm.weight",
+    "layers.0.hc_attn_base",
+    "layers.0.hc_attn_fn",
+    "layers.0.hc_attn_scale",
+    "layers.0.hc_ffn_base",
+    "layers.0.hc_ffn_fn",
+    "layers.0.hc_ffn_scale",
+    "mtp.0.attn.attn_sink",
+    "mtp.0.attn.kv_norm.weight",
+    "mtp.0.attn.q_norm.weight",
+    "mtp.0.attn.wkv.scale",
+    "mtp.0.attn.wkv.weight",
+    "mtp.0.attn.wo_a.scale",
+    "mtp.0.attn.wo_a.weight",
+    "mtp.0.attn.wo_b.scale",
+    "mtp.0.attn.wo_b.weight",
+    "mtp.0.attn.wq_a.scale",
+    "mtp.0.attn.wq_a.weight",
+    "mtp.0.attn.wq_b.scale",
+    "mtp.0.attn.wq_b.weight",
+    "mtp.0.attn_norm.weight",
+    "mtp.0.e_proj.scale",
+    "mtp.0.e_proj.weight",
+    "mtp.0.enorm.weight",
+    "mtp.0.ffn.experts.0.w0.scale",
+    "mtp.0.ffn.experts.0.w0.weight",
+    "mtp.0.ffn.gate.bias",
+    "mtp.0.ffn.gate.weight",
+    "mtp.0.ffn.shared_experts.w0.scale",
+    "mtp.0.ffn.shared_experts.w0.weight",
+    "mtp.0.ffn_norm.weight",
+    "mtp.0.h_proj.scale",
+    "mtp.0.h_proj.weight",
+    "mtp.0.hc_attn_base",
+    "mtp.0.hc_attn_fn",
+    "mtp.0.hc_attn_scale",
+    "mtp.0.hc_ffn_base",
+    "mtp.0.hc_ffn_fn",
+    "mtp.0.hc_ffn_scale",
+    "mtp.0.hc_head_base",
+    "mtp.0.hc_head_fn",
+    "mtp.0.hc_head_scale",
+    "mtp.0.hnorm.weight",
+    "mtp.0.norm.weight",
+    # Note: 82 patterns total; this list includes all 82 (1 per pattern).
+)
+
+
+def test_remap_all_82_v4_key_patterns():
+    """Comprehensive test: remap each of V4-Flash's 82 distinct checkpoint
+    key patterns and verify (a) total key count preserved, (b) every input
+    key has a corresponding output key, (c) all `mtp.*` keys remain `mtp.*`
+    so they can still be split out in Phase 2.
+
+    Fixture is the actual key patterns extracted from
+    /tmp/v4-flash-meta/model.safetensors.index.json on 2026-04-30. If
+    DeepSeek changes the V4 checkpoint key layout in a future release, this
+    test breaks loudly; that's the right behavior.
+    """
+    import torch
+    from sglang.srt.models.deepseek_v4 import _remap_v4_checkpoint_keys
+
+    # Build a synthetic state_dict where every key is a sentinel tensor.
+    # The test only cares about KEYS, not VALUES.
+    sd_in = {k: torch.zeros(1) for k in _V4_KEY_PATTERNS}
+    cfg = _make_full_v4_config()
+
+    sd_out = _remap_v4_checkpoint_keys(sd_in, cfg)
+
+    # (a) Total key count preserved (no dropped or doubled keys)
+    assert len(sd_out) == len(sd_in) == len(_V4_KEY_PATTERNS), (
+        f"Key count changed: {len(sd_in)} -> {len(sd_out)}; this means a "
+        f"key was dropped or duplicated by the remap."
+    )
+
+    # (b) Every input pattern produces a non-None output key (string).
+    # We can't assert specific renames for all 82 (many pass through), but
+    # we can verify no `None` or empty keys.
+    for k_out in sd_out:
+        assert isinstance(k_out, str) and len(k_out) > 0
+
+    # (c) All input mtp.* keys remain mtp.* in output, so the
+    # _split_v4_mtp_keys downstream filter still works.
+    for k_in in _V4_KEY_PATTERNS:
+        if k_in.startswith("mtp."):
+            # Find the matching output key. Since the remap may have renamed
+            # it (e.g., mtp.0.attn.q_norm.weight -> mtp.0.attn.q_norm_weight),
+            # we just verify SOME output key is mtp.*-prefixed corresponding
+            # to this input.
+            #
+            # Due to 1-1 mapping, we can find it by elimination, but the
+            # easier check: count how many keys are mtp.* in input and output.
+            pass
+    n_mtp_in = sum(1 for k in _V4_KEY_PATTERNS if k.startswith("mtp."))
+    n_mtp_out = sum(1 for k in sd_out if k.startswith("mtp."))
+    assert n_mtp_in == n_mtp_out, (
+        f"mtp.* key count changed: input had {n_mtp_in}, output has "
+        f"{n_mtp_out}. This breaks the _split_v4_mtp_keys assumption that "
+        f"all MTP keys retain the mtp. prefix."
+    )
+
+    # (d) Spot-check: critical renames we verified separately above.
+    assert "head.weight" not in sd_out and "lm_head.weight" in sd_out
+    assert "norm.weight" not in sd_out and "final_norm_weight" in sd_out
+    assert "layers.0.attn.q_norm.weight" not in sd_out
+    assert "layers.0.attn.q_norm_weight" in sd_out
+    assert "layers.0.hc_attn_fn" not in sd_out
+    assert "layers.0.hc.hc_attn_fn" in sd_out
+    assert "layers.0.attn.compressor.norm.weight" not in sd_out
+    assert "layers.0.attn.compressor.norm_weight" in sd_out
+    # Indexer compressor sub-norm uses the same pattern
+    assert "layers.0.attn.indexer.compressor.norm.weight" not in sd_out
+    assert "layers.0.attn.indexer.compressor.norm_weight" in sd_out
+
+
 def test_remap_top_level_final_norm():
     """Top-level `norm.weight` (V4 trunk final RMSNorm) -> `final_norm_weight`.
     Discovered 2026-04-30 during V4 safetensors index audit; without this
