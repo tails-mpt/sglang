@@ -520,6 +520,41 @@ register_chat_template(
     )
 )
 
+# DeepSeek-V4 (V4-Flash + V4-Pro) chat template. Added 2026-04-30 alongside
+# the V4 Eagle3 fork extension. V4 has NO Jinja chat_template field in its
+# tokenizer_config.json (uses Python encoding/encoding_dsv4.py instead) — so
+# sglang's automatic detection from tokenizer_config.json does not find a
+# template and we must register one explicitly.
+#
+# Format from V4 reference encoding/README.md:
+#   <｜begin▁of▁sentence｜>{system}<｜User｜>{user}<｜Assistant｜><think>{reasoning}</think>{response}<｜end▁of▁sentence｜>
+#
+# Same special tokens as V3 / V3.2 (`<｜User｜>`, `<｜Assistant｜>`,
+# `<｜end▁of▁sentence｜>`). Thinking-mode + tool-call DSML wrapping are handled
+# by the model's own decoder logic; this template just describes the role
+# prefix/suffix structure that sglang uses when it constructs prompts.
+register_chat_template(
+    ChatTemplate(
+        name="deepseek-v4",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": (
+                "",
+                "",
+            ),
+            "user": (
+                "<｜User｜>",
+                "",
+            ),
+            "assistant": (
+                "<｜Assistant｜>",
+                "<｜end▁of▁sentence｜>",
+            ),
+        },
+        stop_str=("<｜end▁of▁sentence｜>",),
+    )
+)
+
 # Reference: https://huggingface.co/docs/transformers/main/model_doc/glm4_v#usage-example
 register_chat_template(
     ChatTemplate(
@@ -543,6 +578,15 @@ def match_deepseek(model_path: str):
         r"base", model_path, re.IGNORECASE
     ):
         return "deepseek-v3"
+
+
+@register_chat_template_matching_function
+def match_deepseek_v4(model_path: str):
+    """Route deepseek-v4-* model paths to the deepseek-v4 chat template."""
+    if re.search(r"deepseek-v4", model_path, re.IGNORECASE) and not re.search(
+        r"base", model_path, re.IGNORECASE
+    ):
+        return "deepseek-v4"
 
 
 @register_chat_template_matching_function
