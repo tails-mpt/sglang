@@ -391,3 +391,164 @@ def test_eagle3_aux_capture_shape():
 def test_load_weights_from_hf_checkpoint():
     """Load V4-Flash weights from HF checkpoint into the model."""
     pass
+
+
+# =====================================================================
+# Key-remap test stub (for the GPU resume agent picking up load_weights)
+# =====================================================================
+# These tests don't need a real V4 checkpoint. They drive a future
+# `_remap_v4_checkpoint_keys` helper (to be added as a module-level
+# function in deepseek_v4.py) that translates HF checkpoint key names
+# to our parameter names. The mismatches are documented in detail in
+# DeepseekV4ForCausalLM.load_weights's docstring (commit 5e4dba418a).
+#
+# To enable these tests:
+#   1. Add a helper `_remap_v4_checkpoint_keys(state_dict: dict, config
+#      ) -> dict` to deepseek_v4.py. The helper should:
+#      - Rename top-level: head.weight -> lm_head.weight
+#      - Rename per-layer norms: <prefix>.norm.weight -> <prefix>.norm_weight
+#        (q_norm, kv_norm, attn_norm, ffn_norm, compressor.norm)
+#      - Move mHC params: layers.<i>.hc_<x>_<y> -> layers.<i>.hc.hc_<x>_<y>
+#        (where <x> in {attn, ffn} and <y> in {fn, base, scale})
+#   2. Remove the `pytest.mark.skip` decorator from each test below.
+# These tests do NOT cover FP4 dequant — that's separately validated
+# against a real V4 checkpoint on a GPU (see gpu-handoff.md "Step 1").
+
+
+def _make_synthetic_v4_checkpoint_subset(num_layers=4, n_routed_experts=8):
+    """Build a small synthetic state_dict mimicking V4 checkpoint key naming.
+
+    Subset only — covers the keys the remap helper needs to rewrite,
+    not the full 69187-key checkpoint. One sample of each pattern from
+    DeepseekV4ForCausalLM.load_weights's docstring.
+    """
+    import torch
+    sd = {}
+
+    # Top-level
+    sd["embed.weight"] = torch.zeros(256, 64)
+    sd["head.weight"] = torch.zeros(256, 64)  # ← rename to lm_head.weight
+    sd["hc_head_fn"] = torch.zeros(4, 4 * 64)
+    sd["hc_head_base"] = torch.zeros(4)
+    sd["hc_head_scale"] = torch.zeros(1)
+
+    for i in range(num_layers):
+        # Per-layer attn (sample of MQA + MLA Q/O paths)
+        sd[f"layers.{i}.attn.attn_sink"] = torch.zeros(4)
+        sd[f"layers.{i}.attn.q_norm.weight"] = torch.zeros(64)        # ← rename to q_norm_weight
+        sd[f"layers.{i}.attn.kv_norm.weight"] = torch.zeros(64)       # ← rename to kv_norm_weight
+        sd[f"layers.{i}.attn.wq_a.weight"] = torch.zeros(64, 64)
+        sd[f"layers.{i}.attn.wq_b.weight"] = torch.zeros(64 * 4, 64)
+        sd[f"layers.{i}.attn.wkv.weight"] = torch.zeros(64, 64)
+        sd[f"layers.{i}.attn.wo_a.weight"] = torch.zeros(64, 64)
+        sd[f"layers.{i}.attn.wo_b.weight"] = torch.zeros(64, 64)
+
+        # Per-layer norms (RMSNorm submodule .weight in checkpoint)
+        sd[f"layers.{i}.attn_norm.weight"] = torch.zeros(64)          # ← rename to attn_norm_weight
+        sd[f"layers.{i}.ffn_norm.weight"] = torch.zeros(64)           # ← rename to ffn_norm_weight
+
+        # mHC params (FLAT at layer level in checkpoint)
+        sd[f"layers.{i}.hc_attn_fn"] = torch.zeros(24, 4 * 64)        # ← move under .hc
+        sd[f"layers.{i}.hc_attn_base"] = torch.zeros(24)              # ← move under .hc
+        sd[f"layers.{i}.hc_attn_scale"] = torch.zeros(3)              # ← move under .hc
+        sd[f"layers.{i}.hc_ffn_fn"] = torch.zeros(24, 4 * 64)         # ← move under .hc
+        sd[f"layers.{i}.hc_ffn_base"] = torch.zeros(24)               # ← move under .hc
+        sd[f"layers.{i}.hc_ffn_scale"] = torch.zeros(3)               # ← move under .hc
+
+        # MoE gate
+        sd[f"layers.{i}.ffn.gate.weight"] = torch.zeros(n_routed_experts, 64)
+        if i < 2:  # hash routing on first num_hash_layers=2 (in this synthetic)
+            sd[f"layers.{i}.ffn.gate.tid2eid"] = torch.zeros(256, 2, dtype=torch.int32)
+        else:
+            sd[f"layers.{i}.ffn.gate.bias"] = torch.zeros(n_routed_experts)
+
+        # Routed experts (one expert sampled)
+        sd[f"layers.{i}.ffn.experts.0.w1.weight"] = torch.zeros(128, 64)
+        sd[f"layers.{i}.ffn.experts.0.w2.weight"] = torch.zeros(64, 128)
+        sd[f"layers.{i}.ffn.experts.0.w3.weight"] = torch.zeros(128, 64)
+
+        # Shared expert
+        sd[f"layers.{i}.ffn.shared_experts.w1.weight"] = torch.zeros(128, 64)
+        sd[f"layers.{i}.ffn.shared_experts.w2.weight"] = torch.zeros(64, 128)
+        sd[f"layers.{i}.ffn.shared_experts.w3.weight"] = torch.zeros(128, 64)
+
+    return sd
+
+
+@pytest.mark.skip(reason="Requires _remap_v4_checkpoint_keys helper in deepseek_v4.py (TODO(phase1-loader))")
+def test_remap_top_level_keys():
+    """Top-level renames: head.weight -> lm_head.weight (etc)."""
+    from sglang.srt.models.deepseek_v4 import _remap_v4_checkpoint_keys  # noqa: F401
+
+    sd_in = {"head.weight": object(), "embed.weight": object(), "hc_head_fn": object()}
+    cfg = _make_full_v4_config()
+    sd_out = _remap_v4_checkpoint_keys(sd_in, cfg)
+
+    assert "head.weight" not in sd_out
+    assert "lm_head.weight" in sd_out
+    # These should pass through unchanged.
+    assert "embed.weight" in sd_out
+    assert "hc_head_fn" in sd_out
+
+
+@pytest.mark.skip(reason="Requires _remap_v4_checkpoint_keys helper in deepseek_v4.py (TODO(phase1-loader))")
+def test_remap_per_layer_norms():
+    """Per-layer norms: <prefix>.norm.weight -> <prefix>.norm_weight."""
+    from sglang.srt.models.deepseek_v4 import _remap_v4_checkpoint_keys
+
+    sd_in = _make_synthetic_v4_checkpoint_subset(num_layers=2)
+    cfg = _make_full_v4_config()
+    sd_out = _remap_v4_checkpoint_keys(sd_in, cfg)
+
+    for i in range(2):
+        # Renames: q_norm, kv_norm, attn_norm, ffn_norm
+        assert f"layers.{i}.attn.q_norm.weight" not in sd_out
+        assert f"layers.{i}.attn.q_norm_weight" in sd_out
+        assert f"layers.{i}.attn.kv_norm.weight" not in sd_out
+        assert f"layers.{i}.attn.kv_norm_weight" in sd_out
+        assert f"layers.{i}.attn_norm.weight" not in sd_out
+        assert f"layers.{i}.attn_norm_weight" in sd_out
+        assert f"layers.{i}.ffn_norm.weight" not in sd_out
+        assert f"layers.{i}.ffn_norm_weight" in sd_out
+
+
+@pytest.mark.skip(reason="Requires _remap_v4_checkpoint_keys helper in deepseek_v4.py (TODO(phase1-loader))")
+def test_remap_mhc_to_submodule():
+    """mHC params move from flat layer level to V4HCBlock submodule."""
+    from sglang.srt.models.deepseek_v4 import _remap_v4_checkpoint_keys
+
+    sd_in = _make_synthetic_v4_checkpoint_subset(num_layers=3)
+    cfg = _make_full_v4_config()
+    sd_out = _remap_v4_checkpoint_keys(sd_in, cfg)
+
+    for i in range(3):
+        for x in ("attn", "ffn"):
+            for y in ("fn", "base", "scale"):
+                old = f"layers.{i}.hc_{x}_{y}"
+                new = f"layers.{i}.hc.hc_{x}_{y}"
+                assert old not in sd_out, f"old key {old} still present"
+                assert new in sd_out, f"new key {new} missing"
+
+
+@pytest.mark.skip(reason="Requires _remap_v4_checkpoint_keys helper in deepseek_v4.py (TODO(phase1-loader))")
+def test_remap_pass_through_for_unrenamed_keys():
+    """Keys that don't need remap pass through unchanged."""
+    from sglang.srt.models.deepseek_v4 import _remap_v4_checkpoint_keys
+
+    sd_in = _make_synthetic_v4_checkpoint_subset(num_layers=2)
+    cfg = _make_full_v4_config()
+    n_in = len(sd_in)
+    sd_out = _remap_v4_checkpoint_keys(sd_in, cfg)
+
+    # Total key count preserved (every input key produces exactly one output key).
+    assert len(sd_out) == n_in
+
+    # Spot-check: tid2eid, gate.weight, expert weights, attn_sink unchanged.
+    for i in range(2):
+        if i < 2:  # hash layers in our synthetic
+            assert f"layers.{i}.ffn.gate.tid2eid" in sd_out
+        assert f"layers.{i}.attn.attn_sink" in sd_out
+        assert f"layers.{i}.ffn.gate.weight" in sd_out
+        assert f"layers.{i}.ffn.experts.0.w1.weight" in sd_out
+        assert f"layers.{i}.ffn.shared_experts.w2.weight" in sd_out
+        assert f"layers.{i}.attn.wq_a.weight" in sd_out
