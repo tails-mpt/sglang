@@ -527,6 +527,37 @@ def test_remap_mhc_to_submodule():
                 assert new in sd_out, f"new key {new} missing"
 
 
+def test_split_mtp_keys():
+    """_split_v4_mtp_keys partitions a state_dict into (main_dict, mtp_dict)
+    based on the `mtp.` prefix per CLAUDE.md rule #12 (MTP loaded but not run).
+    """
+    import torch
+    from sglang.srt.models.deepseek_v4 import _split_v4_mtp_keys
+
+    sd_in = {
+        "embed.weight": torch.zeros(256, 64),
+        "lm_head.weight": torch.zeros(256, 64),
+        "layers.0.attn.attn_sink": torch.zeros(4),
+        "layers.0.ffn.gate.weight": torch.zeros(8, 64),
+        "mtp.0.attn.wq_a.weight": torch.zeros(64, 64),
+        "mtp.0.ffn_norm_weight": torch.zeros(64),
+        "mtp.0.hc_attn_fn": torch.zeros(24, 256),
+    }
+    main, mtp = _split_v4_mtp_keys(sd_in)
+    # 4 main + 3 mtp = 7 = total
+    assert len(main) == 4
+    assert len(mtp) == 3
+    # Round-trip preservation
+    assert set(main.keys()) | set(mtp.keys()) == set(sd_in.keys())
+    assert set(main.keys()) & set(mtp.keys()) == set()
+    # All mtp keys start with mtp.
+    for k in mtp:
+        assert k.startswith("mtp.")
+    # No main keys start with mtp.
+    for k in main:
+        assert not k.startswith("mtp.")
+
+
 def test_remap_pass_through_for_unrenamed_keys():
     """Keys that don't need remap pass through unchanged."""
     from sglang.srt.models.deepseek_v4 import _remap_v4_checkpoint_keys

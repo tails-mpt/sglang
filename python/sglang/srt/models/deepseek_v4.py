@@ -2063,12 +2063,57 @@ class DeepseekV4ForCausalLM(nn.Module):
           Total: 69187 keys (most are expert weights — 256 experts × 43
             layers × 3 weights × 2 (weight+scale) = 66048 expert keys)
         """
+        # Skeleton: laptop-deliverable phases done; FP4/FP8 dequant + the
+        # actual load_state_dict call remain as TODO(phase1-fp4) for the
+        # GPU resume session.
+
+        state_dict: Dict[str, torch.Tensor] = dict(weights)
+        n_in = len(state_dict)
+
+        # Phase 1: top-level renames + RMSNorm submodule -> Parameter +
+        # mHC flat -> .hc submodule. Pure key-string remap; tested via
+        # test/manual/models/test_deepseek_v4_models.py:test_remap_*.
+        state_dict = _remap_v4_checkpoint_keys(state_dict, self.config)
+
+        # Phase 2: split MTP keys out (rule #12: loaded for HF compat
+        # but not run at Eagle3 inference). Caller can persist or
+        # discard mtp_dict per its preference.
+        state_dict, mtp_dict = _split_v4_mtp_keys(state_dict)
+
+        # Phase 3: FP8 / FP4 dequant for non-FP-aware Linear.
+        # TODO(phase1-fp4): wrap state_dict with a dequantization pass that
+        # consumes (weight, scale) pairs and produces a single BF16/FP32
+        # weight tensor (or, alternatively, skip this if/when V4-aware
+        # FP8/FP4 Linear classes are wired into the model and we keep
+        # weights packed). The needed kernels:
+        #   FP8 e4m3fn weight + e8m0fnu scale (128x128 weight blocks):
+        #       all attn/mtp non-expert linears + ffn.gate.weight +
+        #       ffn.shared_experts.w*. sglang already has this path at
+        #       sglang.srt.layers.quantization.fp8_kernel — reuse.
+        #   FP4 e2m1fn_x2 weight + e8m0fnu scale (1x32 along K):
+        #       ffn.experts.<j>.w{1,2,3} (66048 of the 69187 total keys
+        #       are expert weight + scale tensors). NEW kernel work.
+        # Until then, raise loudly so the smoke test fails at this step
+        # instead of silently in a downstream forward.
         raise NotImplementedError(
-            "DeepseekV4ForCausalLM.load_weights — see TODO(phase1-loader) docstring "
-            "above for the full HF checkpoint -> model parameter mapping table. "
-            "Until this lands, instantiate the model with random weights "
-            "for shape testing only."
+            f"DeepseekV4ForCausalLM.load_weights — Phases 1-2 DONE on laptop "
+            f"({n_in} input keys -> {len(state_dict)} main + {len(mtp_dict)} MTP "
+            f"keys). Phase 3 (FP8/FP4 dequant) is GPU-required; see "
+            f"TODO(phase1-fp4) above. Run on a GPU VM with a checkpoint "
+            f"that supports torch.float4_e2m1fn_x2 and torch.float8_e8m0fnu."
         )
+
+        # Once Phase 3 lands, complete the loader with:
+        #
+        # missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        # if missing or unexpected:
+        #     logger.warning(
+        #         "V4 weight load: missing=%d unexpected=%d. "
+        #         "First 5 missing: %s. First 5 unexpected: %s. "
+        #         "MTP keys deliberately discarded: %d (rule #12).",
+        #         len(missing), len(unexpected),
+        #         list(missing)[:5], list(unexpected)[:5], len(mtp_dict),
+        #     )
 
 
 # ============================================================================
@@ -2212,6 +2257,44 @@ def _is_top_level_layer_or_mtp(prefix: str) -> bool:
     if parts[0] not in ("layers", "mtp"):
         return False
     return parts[1].isdigit()
+
+
+def _split_v4_mtp_keys(
+    state_dict: Dict[str, torch.Tensor],
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """Split a remapped V4 state_dict into (main_dict, mtp_dict).
+
+    Per CLAUDE.md rule #12: V4's native MTP block is loaded for HF
+    checkpoint compatibility but NOT executed at Eagle3 inference (the
+    Eagle3 draft head replaces it). Our model's `self.mtp` is currently
+    `ModuleList(nn.Identity)` placeholders — calling
+    `self.load_state_dict(state_dict, strict=False)` with MTP keys still
+    in state_dict would mark them all as "unexpected" and clutter the
+    log. Splitting them out lets the loader keep the unexpected-key
+    log meaningful (only flag actually-unexpected keys, not the
+    intentionally-discarded MTP keys).
+
+    Args:
+        state_dict: V4 state_dict (already key-remapped via
+            _remap_v4_checkpoint_keys, but raw keys also work since
+            `mtp.<i>.*` keys aren't touched by that remap).
+
+    Returns:
+        (main_dict, mtp_dict): main_dict has all non-MTP keys (will
+        load normally); mtp_dict has all `mtp.<i>.*` keys (caller may
+        log, persist for HF compat, or discard — all 3 are valid
+        per rule #12).
+
+    Does not modify the input dict; returns two new dicts.
+    """
+    main_dict: Dict[str, torch.Tensor] = {}
+    mtp_dict: Dict[str, torch.Tensor] = {}
+    for key, tensor in state_dict.items():
+        if key.startswith("mtp."):
+            mtp_dict[key] = tensor
+        else:
+            main_dict[key] = tensor
+    return main_dict, mtp_dict
 
 
 # ============================================================================
