@@ -898,4 +898,3 @@ def test_dequantize_v4_fp8_fp4_e2e_synthetic():
     assert "layers.0.attn_norm_weight" in out
     assert "embed.weight" in out
     assert out["layers.0.attn_norm_weight"].shape == (4096,)
-        assert f"layers.{i}.attn.wq_a.weight" in sd_out
