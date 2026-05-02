@@ -84,18 +84,22 @@ logger = logging.getLogger(__name__)
 
 
 def _get_moe_ep_rank_world_size():
-    """Return (ep_rank, ep_world_size) when sglang's distributed runtime is
-    initialized; otherwise (0, 1) so single-process construction still works.
-    Used to shard the 256 routed experts across ranks at __init__ time so we
-    don't blow VRAM by replicating all experts on every GPU."""
+    """Return (rank, world_size) for sharding the 256 routed experts across
+    ranks at __init__ time. V4 reference shards experts across ALL ranks (it
+    uses TP for everything; there's no separate EP dimension), so we prefer
+    `torch.distributed.get_world_size()` over sglang's MoE-EP getter (which
+    may not be initialized when DeepseekV4MoE.__init__ runs and would
+    return 1, blowing VRAM).
+    Fall back to (0, 1) when distributed isn't initialized at all (single-
+    process unit tests).
+    """
     try:
-        from sglang.srt.distributed.parallel_state import (
-            get_moe_expert_parallel_rank,
-            get_moe_expert_parallel_world_size,
-        )
-        return get_moe_expert_parallel_rank(), get_moe_expert_parallel_world_size()
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank(), dist.get_world_size()
     except Exception:
-        return 0, 1
+        pass
+    return 0, 1
 
 
 # ============================================================================
