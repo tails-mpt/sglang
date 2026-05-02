@@ -381,6 +381,17 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             coins_for_final_sampling = torch.rand(
                 (bs,), dtype=torch.float32, device=batch.device
             )
+            # Track-B Squeeze: typical-acceptance verify mode overrides both
+            # threshold knobs with a single alpha. alpha=1.0 reproduces
+            # rejection sampling (the strict default).
+            _server_args = get_global_server_args()
+            if _server_args.speculative_verify_mode == "typical_acceptance":
+                _alpha = _server_args.speculative_typical_acceptance_alpha
+                _threshold_single = _alpha
+                _threshold_acc = _alpha
+            else:
+                _threshold_single = _server_args.speculative_accept_threshold_single
+                _threshold_acc = _server_args.speculative_accept_threshold_acc
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -393,8 +404,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 uniform_samples_for_final_sampling=coins_for_final_sampling,
                 target_probs=target_probs,
                 draft_probs=draft_probs,
-                threshold_single=get_global_server_args().speculative_accept_threshold_single,
-                threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
+                threshold_single=_threshold_single,
+                threshold_acc=_threshold_acc,
                 deterministic=True,
             )
 

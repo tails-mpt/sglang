@@ -514,6 +514,14 @@ class ServerArgs:
     speculative_adaptive_topk_recovery: float = 0.0
     speculative_adaptive_topk_window: int = 32
     speculative_adaptive_topk_alpha: float = 0.1  # EMA smoothing
+    # Track-B Squeeze: relaxed verification via Medusa-style typical-acceptance.
+    # When `speculative_verify_mode == "typical_acceptance"`, both threshold knobs above
+    # are overridden by `speculative_typical_acceptance_alpha` at verify time.
+    # Default `rejection_sampling` preserves existing strict behavior.
+    speculative_verify_mode: Literal[
+        "rejection_sampling", "typical_acceptance"
+    ] = "rejection_sampling"
+    speculative_typical_acceptance_alpha: float = 0.8
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
@@ -5131,6 +5139,34 @@ class ServerArgs:
             type=float,
             help="A3.1 — EMA smoothing factor in [0, 1] for accept-length tracking. Higher = more responsive to recent batches.",
             default=ServerArgs.speculative_adaptive_topk_alpha,
+        )
+        parser.add_argument(
+            "--speculative-verify-mode",
+            type=str,
+            choices=["rejection_sampling", "typical_acceptance"],
+            default=ServerArgs.speculative_verify_mode,
+            help=(
+                "Verification regime for speculative decoding. "
+                "'rejection_sampling' (default) is strict: a draft token is accepted "
+                "iff coin <= prob_acc/threshold_acc OR target_prob_single >= "
+                "threshold_single, with both thresholds defaulting to 1.0. "
+                "'typical_acceptance' is the Medusa-style alpha-tunable mode: both "
+                "thresholds are set to --speculative-typical-acceptance-alpha at verify "
+                "time, trading a small amount of distributional fidelity for higher "
+                "accept rate (and hence higher throughput) on long-tail tokens. The "
+                "trade-off is alpha-tunable; alpha=1.0 reproduces rejection sampling, "
+                "alpha~0.7-0.9 is the typical Squeeze Track-B operating range."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-typical-acceptance-alpha",
+            type=float,
+            default=ServerArgs.speculative_typical_acceptance_alpha,
+            help=(
+                "Alpha threshold for typical_acceptance verify mode. Ignored when "
+                "--speculative-verify-mode is rejection_sampling. Range (0, 1]. "
+                "Smaller values -> higher accept rate, lower distributional fidelity."
+            ),
         )
         parser.add_argument(
             "--speculative-token-map",
