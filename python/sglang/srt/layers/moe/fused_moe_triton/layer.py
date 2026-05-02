@@ -584,8 +584,12 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         # if expert_id is None, then
         # all the experts are loaded at the same time
+        # Bug fix (2026-05-02): the prior `not expert_id` predicate was True
+        # for expert_id=0 (Python truthiness), incorrectly routing the
+        # first expert's per-expert 2D tensor into the fused-3D path. Use
+        # explicit `is None` check to match the comment's intent.
         if (
-            not expert_id
+            expert_id is None
             and self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
