@@ -306,12 +306,13 @@ def _load_deepseek_v4_model(
     with open(config_file, "r") as f:
         config_json = json.load(f)
 
-    # Preserve the original fields under a backup key so the V4 model class
-    # can still detect "this was originally deepseek_v4".
+    # Preserve the original model_type for cross-checks; SPOOF only model_type to
+    # `deepseek_v3` so transformers AutoConfig accepts the file. Keep
+    # architectures=["DeepseekV4ForCausalLM"] so sglang's model registry
+    # picks our DeepseekV4ForCausalLM (in models/deepseek_v4.py), NOT V3.
     config_json["_original_model_type"] = config_json.get("model_type", "deepseek_v4")
-    config_json["_original_architectures"] = config_json.get("architectures", ["DeepseekV4ForCausalLM"])
-    config_json["architectures"] = ["DeepseekV3ForCausalLM"]
     config_json["model_type"] = "deepseek_v3"
+    # NOTE: architectures field NOT spoofed.
 
     tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
     os.makedirs(tmp_path, exist_ok=True)
