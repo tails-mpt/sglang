@@ -1524,115 +1524,148 @@ class V4Expert(nn.Module):
 class DeepseekV4MoE(nn.Module):
     """V4 MoE: 256 routed experts top-6 + 1 shared expert.
 
-    Direct port of V4 reference MoE (inference/model.py lines 609-644).
+    Phase 3 rewrite (2026-05-02): replace the manual nn.ModuleList of
+    V4Expert objects with sglang's `FusedMoE` so expert weights are
+    allocated as packed FP4 (uint8 + uint8 scales) directly via
+    `Mxfp4MoEMethod.create_weights`. This shrinks per-GPU footprint
+    ~4x at __init__ time vs the prior BF16 stand-ins.
 
-    Routing: V4Gate above. Hash routing on first num_hash_layers=3 layers
-    (indices from tid2eid lookup); score-based routing on the rest
-    (sqrtsoftplus + topk).
+    Routing: V4Gate (above) does the V4-specific work — hash routing on
+    layers 0..num_hash_layers-1 (`tid2eid` lookup) and sqrtsoftplus +
+    noaux_tc top-k on later layers. V4Gate already returns the
+    `(weights, indices)` tuple FusedMoE expects, so we wrap directly
+    into a `StandardTopKOutput` and feed it to `FusedMoE.forward`
+    (bypassing sglang's `TopK` since its scoring functions don't include
+    sqrtsoftplus / hash).
 
-    Expert weights: FP4 (`torch.float4_e2m1fn_x2`) with FP8 (e8m0fnu) scales,
-    quantized in 32-element blocks along K (reduce dim). Shared expert is
-    BF16 / FP8 (matching the rest of the model's non-expert quantization).
+    Shared expert: kept as a separate Linear-only module since V4 has
+    only 1 shared expert per layer. We don't fuse into FusedMoE because
+    the share is small and not FP4 (it's BF16/FP8 like the rest of the
+    non-expert path).
 
-    TP behavior: V4 reference shards experts across world_size. With
-    world_size=1 this is pass-through. TODO(phase1-tp): apply
-    expert-parallel sharding when integrated into sglang's TP runtime.
+    EP/TP: FusedMoE handles expert sharding across the moe-EP world via
+    `Mxfp4MoEMethod.create_weights(num_experts=…)` — we pass the global
+    expert count and the layer takes care of slicing per-rank.
     """
 
-    def __init__(self, layer_id: int, config: PretrainedConfig):
+    def __init__(
+        self,
+        layer_id: int,
+        config: PretrainedConfig,
+        quant_config: Optional["QuantizationConfig"] = None,  # noqa: F821
+        prefix: str = "",
+    ):
         super().__init__()
         self.layer_id = layer_id
         self.dim = config.hidden_size
-
-        # Expert parallelism: shard the 256 routed experts across EP ranks.
-        # Single-process / no-distributed -> ep_world_size=1 (all local).
-        ep_rank, ep_world_size = _get_moe_ep_rank_world_size()
-        self.ep_rank = ep_rank
-        self.ep_world_size = ep_world_size
-
-        self.n_routed_experts = config.n_routed_experts
-        if config.n_routed_experts % ep_world_size != 0:
-            raise ValueError(
-                f"V4 MoE: n_routed_experts ({config.n_routed_experts}) must be "
-                f"divisible by ep_world_size ({ep_world_size})"
-            )
-        self.n_local_experts = config.n_routed_experts // ep_world_size
-        self.n_activated_experts = config.num_experts_per_tok
-        self.experts_start_idx = ep_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        moe_inter_dim = config.moe_intermediate_size
+        swiglu_limit = getattr(config, "swiglu_limit", 0.0)
         n_shared_experts = getattr(config, "n_shared_experts", 1)
         assert n_shared_experts == 1, (
             f"V4 expects exactly 1 shared expert per layer; config has {n_shared_experts}"
         )
 
-        # Routing gate (hash-or-score per layer_id < num_hash_layers).
-        self.gate = V4Gate(layer_id, config)
+        # ---- expert quant_config -------------------------------------------
+        # V4's HF quantization_config covers the FP8-blockwise non-expert
+        # path; the experts are FP4 (config.expert_dtype == "fp4"). The
+        # incoming `quant_config` from sglang's loader will be the FP8
+        # config. For experts specifically we override with `Mxfp4Config`
+        # so `Mxfp4MoEMethod.create_weights` allocates uint8-packed FP4
+        # buffers (NOT BF16 stand-ins).
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+        from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 
-        # Routed experts. V4 reference stores None for non-local-rank experts
-        # to save memory; with world_size=1 this is just a list of all experts.
-        # TODO(phase1-fp4): wire FP4 expert dtype handling. For now bf16 storage.
-        moe_inter_dim = config.moe_intermediate_size
-        swiglu_limit = getattr(config, "swiglu_limit", 0.0)
-        self.experts = nn.ModuleList(
-            [
-                V4Expert(self.dim, moe_inter_dim, swiglu_limit=swiglu_limit)
-                if self.experts_start_idx <= i < self.experts_end_idx
-                else None
-                for i in range(self.n_routed_experts)
-            ]
+        if getattr(config, "expert_dtype", "fp4") == "fp4":
+            self.expert_quant_config = Mxfp4Config(
+                is_checkpoint_mxfp4_serialized=True,
+            )
+        else:
+            # Future-proof for V4 variants that ship BF16 experts (unlikely).
+            self.expert_quant_config = quant_config
+
+        self.gate = V4Gate(layer_id, config)
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+
+        # ---- FusedMoE (FP4-aware) ------------------------------------------
+        self.experts = get_moe_impl_class(self.expert_quant_config)(
+            num_experts=config.n_routed_experts,
+            top_k=self.top_k,
+            layer_id=self.layer_id,
+            hidden_size=config.hidden_size,
+            intermediate_size=moe_inter_dim,
+            quant_config=self.expert_quant_config,
+            prefix=(prefix + ".experts") if prefix else "experts",
+            activation="silu",
         )
 
-        # Shared expert (always-on, every token).
-        self.shared_experts = V4Expert(self.dim, moe_inter_dim, swiglu_limit=swiglu_limit)
+        # ---- shared expert (separate, always-on) ---------------------------
+        # Kept as a small Linear-only module. V4 reference uses bf16 storage
+        # for the shared expert; we mirror that. With hidden=4096 and
+        # inter_dim=2048, the shared expert is ~50MB BF16 — negligible.
+        self.shared_experts = V4Expert(
+            self.dim, moe_inter_dim, swiglu_limit=swiglu_limit
+        )
+
+        # ---- distributed bookkeeping ---------------------------------------
+        # FusedMoE owns the routed-expert sharding and intra-MoE all_reduce.
+        # We still need the TP world_size for the post-MoE all_reduce that
+        # sums partial outputs across the TP group (FusedMoE returns local
+        # contributions when reduce_results=False).
+        try:
+            import torch.distributed as dist
+            self.tp_world_size = dist.get_world_size() if dist.is_initialized() else 1
+        except Exception:
+            self.tp_world_size = 1
 
     def forward(
         self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """V4 MoE forward. Direct port of V4 reference MoE.forward (lines 629-644).
+        """V4 MoE forward.
 
         Args:
             x: [B, T, dim] hidden state
             input_ids: [B, T] token ids (required for hash-routing layers)
 
         Returns:
-            y: [B, T, dim] MoE output (sum of routed experts + shared expert)
+            y: [B, T, dim] MoE output (routed experts sum + shared expert)
         """
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
         shape = x.size()
         x_flat = x.view(-1, self.dim)
         flat_input_ids = input_ids.flatten() if input_ids is not None else None
+
+        # V4Gate returns (weights, indices) — already in the StandardTopKOutput
+        # shape that FusedMoE consumes. We don't have raw router_logits in
+        # the same shape (V4Gate folds the topk gather inside), but
+        # FusedMoE only uses `topk_weights` and `topk_ids`; `router_logits`
+        # is informational and can be the gathered weights for traceability.
         weights, indices = self.gate(x_flat, flat_input_ids)
+        topk_output = StandardTopKOutput(
+            topk_weights=weights.to(x_flat.dtype),
+            topk_ids=indices.to(torch.int32),
+            router_logits=weights.to(x_flat.dtype),
+        )
 
-        # Accumulate routed expert outputs.
-        y = torch.zeros_like(x_flat, dtype=torch.float32)
+        # FusedMoE forward: takes (hidden_states, topk_output). It owns the
+        # all-to-all dispatch, FP4 dequant per expert, swiglu, and
+        # all-to-all combine. Returns local-rank partial sum.
+        moe_out = self.experts(x_flat, topk_output)
 
-        # V4 reference uses bincount + per-expert iteration. This is fine for
-        # bf16 inference; sglang has a fused MoE path for higher throughput
-        # we'll wire later (TODO(phase1-fused-moe)).
-        counts = torch.bincount(
-            indices.flatten().long(), minlength=self.n_routed_experts
-        ).tolist()
-        for i in range(self.experts_start_idx, self.experts_end_idx):
-            if counts[i] == 0:
-                continue
-            expert = self.experts[i]
-            idx, top = torch.where(indices == i)
-            y[idx] = y[idx] + expert(x_flat[idx], weights[idx, top, None])
-
-        # Cross-rank reduce: sum the partial expert outputs across EP ranks
-        # so every rank sees the full routed-expert sum before adding the
-        # shared expert. No-op when ep_world_size=1.
-        if self.ep_world_size > 1:
+        # Cross-TP-rank reduce so every rank holds the full routed sum
+        # before adding the shared expert.
+        if self.tp_world_size > 1:
             try:
                 import torch.distributed as dist
                 from sglang.srt.distributed.parallel_state import get_tp_group
-                group = get_tp_group()
-                dist.all_reduce(y, group=group)
+                dist.all_reduce(moe_out, group=get_tp_group())
             except Exception:
                 pass
 
-        # Shared expert: always-on; runs on every token.
-        y = y + self.shared_experts(x_flat)
-        return y.type_as(x).view(shape)
+        # Shared expert (BF16, every token).
+        y = moe_out + self.shared_experts(x_flat)
+        return y.view(shape)
 
 
 # ============================================================================
@@ -1645,7 +1678,12 @@ class DeepseekV4DecoderLayer(nn.Module):
     `config.compress_ratios[layer_id]`. mHC residuals wrap both sublayers.
     """
 
-    def __init__(self, layer_id: int, config: PretrainedConfig):
+    def __init__(
+        self,
+        layer_id: int,
+        config: PretrainedConfig,
+        quant_config: Optional["QuantizationConfig"] = None,  # noqa: F821
+    ):
         super().__init__()
         self.layer_id = layer_id
 
@@ -1656,7 +1694,13 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         # MoE feed-forward. V4Gate inside DeepseekV4MoE checks
         # layer_id < config.num_hash_layers for the hash-routing branch.
-        self.ffn = DeepseekV4MoE(layer_id, config)
+        # Pass quant_config so FusedMoE allocates packed FP4 expert weights.
+        self.ffn = DeepseekV4MoE(
+            layer_id,
+            config,
+            quant_config=quant_config,
+            prefix=f"layers.{layer_id}.ffn",
+        )
 
         # mHC residual-stream wrapping. Wraps both attn and ffn separately.
         self.hc = V4HCBlock(
@@ -1732,6 +1776,13 @@ class DeepseekV4ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
 
+        # sglang's loader passes `quant_config` (the FP8-blockwise config from
+        # V4's HF quantization_config) as a kwarg. Capture it so the decoder
+        # layers / MoE blocks can construct FusedMoE with the right scheme.
+        # Each MoE block then overrides to Mxfp4Config for the expert path.
+        quant_config = kwargs.get("quant_config", None)
+        self.quant_config = quant_config
+
         # Eagle3 capture config; populated by set_eagle3_layers_to_capture.
         self._eagle3_layers_to_capture: List[int] = []
         self._enable_return_hidden_states: bool = False
@@ -1739,7 +1790,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Embedding + main transformer trunk.
         self.embed = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            [DeepseekV4DecoderLayer(i, config) for i in range(config.num_hidden_layers)]
+            [
+                DeepseekV4DecoderLayer(i, config, quant_config=quant_config)
+                for i in range(config.num_hidden_layers)
+            ]
         )
 
         # Final RMSNorm before head (V4 reference line 787).
@@ -2101,14 +2155,22 @@ class DeepseekV4ForCausalLM(nn.Module):
           Total: 69187 keys (most are expert weights — 256 experts × 43
             layers × 3 weights × 2 (weight+scale) = 66048 expert keys)
         """
-        # Skeleton: laptop-deliverable phases done; FP4/FP8 dequant + the
-        # actual load_state_dict call remain as TODO(phase1-fp4) for the
-        # GPU resume session.
+        # Phase 3 rewrite (2026-05-02): split expert keys out and route them
+        # through FusedMoE.weight_loader so they land in packed-FP4 storage
+        # (Mxfp4MoEMethod-allocated uint8 buffers + uint8 scales). Non-expert
+        # keys still use the dict + dequant -> load_state_dict path, since
+        # they're FP8-blockwise (not FP4) and our attention/etc. modules are
+        # plain BF16 nn.Linear. This avoids the 4x BF16-stand-in blowup on
+        # the 66k expert weight keys (the prior OOM cause).
 
         state_dict: Dict[str, torch.Tensor] = dict(weights)
         n_in = len(state_dict)
 
-        # Phase 1: top-level renames + RMSNorm submodule -> Parameter +
+        # Phase 1a: split expert keys (handed off to FusedMoE.weight_loader)
+        # vs everything-else (dict load via load_state_dict).
+        state_dict, n_expert_loaded = self._load_v4_expert_weights(state_dict)
+
+        # Phase 1b: top-level renames + RMSNorm submodule -> Parameter +
         # mHC flat -> .hc submodule. Pure key-string remap; tested via
         # test/manual/models/test_deepseek_v4_models.py:test_remap_*.
         state_dict = _remap_v4_checkpoint_keys(state_dict, self.config)
@@ -2118,37 +2180,117 @@ class DeepseekV4ForCausalLM(nn.Module):
         # discard mtp_dict per its preference.
         state_dict, mtp_dict = _split_v4_mtp_keys(state_dict)
 
-        # Phase 3: FP8 / FP4 dequant on load. Path (b) from the docstring —
-        # the dequant-on-load fallback. Memory cost: ~2x blowup on FP4 expert
-        # weights (66048 of 69187 keys). Acceptable for Phase 4 smoke and
-        # Phase 4.5 baselines on H100:8 (640GB) where 159GB FP-stored ->
-        # ~318GB BF16 fits with KV cache headroom. Phase 5 production
-        # training will swap to V4-aware FP8/FP4 Linear classes (path a).
+        # Phase 3: FP8 dequant on remaining (non-expert) keys. The experts
+        # were already loaded in packed FP4 form via FusedMoE.weight_loader
+        # in Phase 1a. Here we only dequant the FP8-blockwise non-expert
+        # weights (attention wq_a/wq_b/wkv/wo_a/wo_b, e_proj/h_proj, the
+        # router gate, the shared expert) — far less memory blowup.
         state_dict, n_dequanted_fp8, n_dequanted_fp4 = _dequantize_v4_fp8_fp4(
             state_dict, target_dtype=torch.bfloat16
         )
 
-        # Phase 4: actual load. strict=False so we don't crash on intentional
-        # mismatches (see Sessions 5-7 for the structural list).
+        # Phase 4: actual load (non-expert path).
         missing, unexpected = self.load_state_dict(state_dict, strict=False)
         if missing or unexpected:
             logger.warning(
-                "V4 weight load: %d input keys -> %d main + %d MTP. "
-                "Dequanted FP8 pairs: %d, FP4 pairs: %d. "
+                "V4 weight load: %d input keys -> %d expert + %d main + %d MTP. "
+                "Dequanted FP8: %d, FP4 (residual): %d. "
                 "After load: missing=%d, unexpected=%d. "
                 "First 5 missing: %s. First 5 unexpected: %s.",
-                n_in, len(state_dict), len(mtp_dict),
+                n_in, n_expert_loaded, len(state_dict), len(mtp_dict),
                 n_dequanted_fp8, n_dequanted_fp4,
                 len(missing), len(unexpected),
                 list(missing)[:5], list(unexpected)[:5],
             )
         else:
             logger.info(
-                "V4 weight load OK: %d input keys -> %d main + %d MTP. "
-                "Dequanted FP8 pairs: %d, FP4 pairs: %d.",
-                n_in, len(state_dict), len(mtp_dict),
+                "V4 weight load OK: %d input keys -> %d expert + %d main + %d MTP. "
+                "Dequanted FP8: %d, FP4 (residual): %d.",
+                n_in, n_expert_loaded, len(state_dict), len(mtp_dict),
                 n_dequanted_fp8, n_dequanted_fp4,
             )
+
+    def _load_v4_expert_weights(
+        self, state_dict: Dict[str, torch.Tensor]
+    ) -> Tuple[Dict[str, torch.Tensor], int]:
+        """Route V4 expert weights through FusedMoE.weight_loader.
+
+        V4 checkpoint keys for routed experts:
+          layers.<i>.ffn.experts.<j>.w1.weight        # gate proj  (FP4 packed in int8)
+          layers.<i>.ffn.experts.<j>.w1.scale         # gate scale (uint8 e8m0)
+          layers.<i>.ffn.experts.<j>.w2.weight        # down proj  (FP4)
+          layers.<i>.ffn.experts.<j>.w2.scale         # down scale
+          layers.<i>.ffn.experts.<j>.w3.weight        # up proj    (FP4)
+          layers.<i>.ffn.experts.<j>.w3.scale         # up scale
+
+        FusedMoE parameters (allocated by Mxfp4MoEMethod.create_weights):
+          layers.<i>.ffn.experts.w13_weight           # stacked gate+up across experts
+          layers.<i>.ffn.experts.w13_weight_scale
+          layers.<i>.ffn.experts.w2_weight            # stacked down across experts
+          layers.<i>.ffn.experts.w2_weight_scale
+
+        For each matched expert key, call FusedMoE.weight_loader with
+        (param, loaded_weight, weight_name=<full key>, shard_id, expert_id).
+        Mxfp4MoEMethod owns the per-expert / per-shard slot logic.
+        """
+        import re
+        n_experts = self.config.n_routed_experts
+        # Pattern: layers.<L>.ffn.experts.<E>.w<K>.{weight,scale}
+        pat = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w([123])\.(weight|scale)$")
+        # Map shard_id (matches FusedMoE._weight_loader_impl conventions):
+        #   w1 (gate) -> shard "w1" (lands in w13_*)
+        #   w3 (up)   -> shard "w3" (lands in w13_*)
+        #   w2 (down) -> shard "w2" (lands in w2_*)
+        # Suffix mapping: weight -> {w13_weight, w2_weight}; scale -> {w13_weight_scale, w2_weight_scale}
+        params = dict(self.named_parameters())
+        loaded = 0
+        leftover: Dict[str, torch.Tensor] = {}
+        for name, tensor in state_dict.items():
+            m = pat.match(name)
+            if not m:
+                leftover[name] = tensor
+                continue
+            layer_id, expert_id, shard_idx, suffix = (
+                int(m.group(1)),
+                int(m.group(2)),
+                m.group(3),
+                m.group(4),
+            )
+            shard_id = f"w{shard_idx}"
+            # which FusedMoE param does this go into?
+            if shard_idx in ("1", "3"):
+                # gate/up -> w13_*
+                param_name = (
+                    f"layers.{layer_id}.ffn.experts.w13_weight"
+                    if suffix == "weight"
+                    else f"layers.{layer_id}.ffn.experts.w13_weight_scale"
+                )
+            else:  # shard_idx == "2"
+                # down -> w2_*
+                param_name = (
+                    f"layers.{layer_id}.ffn.experts.w2_weight"
+                    if suffix == "weight"
+                    else f"layers.{layer_id}.ffn.experts.w2_weight_scale"
+                )
+
+            param = params.get(param_name)
+            if param is None:
+                # FusedMoE param not found — likely because the EP shard for this layer
+                # doesn't include this expert. Drop silently; FusedMoE handles its own
+                # rank-locality via weight_loader -> _map_global_expert_id_to_local.
+                continue
+
+            wl = getattr(param, "weight_loader", None)
+            if wl is None:
+                # Param exists but no weight_loader attached -> sglang's allocator path
+                # didn't run (e.g. unit test path). Fall back to dict load.
+                leftover[name] = tensor
+                continue
+
+            wl(param, tensor, name, shard_id=shard_id, expert_id=expert_id)
+            loaded += 1
+
+        return leftover, loaded
 
 
 # ============================================================================
