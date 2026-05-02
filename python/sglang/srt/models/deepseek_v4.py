@@ -83,6 +83,21 @@ from transformers import PretrainedConfig
 logger = logging.getLogger(__name__)
 
 
+def _get_moe_ep_rank_world_size():
+    """Return (ep_rank, ep_world_size) when sglang's distributed runtime is
+    initialized; otherwise (0, 1) so single-process construction still works.
+    Used to shard the 256 routed experts across ranks at __init__ time so we
+    don't blow VRAM by replicating all experts on every GPU."""
+    try:
+        from sglang.srt.distributed.parallel_state import (
+            get_moe_expert_parallel_rank,
+            get_moe_expert_parallel_world_size,
+        )
+        return get_moe_expert_parallel_rank(), get_moe_expert_parallel_world_size()
+    except Exception:
+        return 0, 1
+
+
 # ============================================================================
 # Module-level helpers ported from V4 reference inference/model.py
 # ============================================================================
@@ -1525,12 +1540,22 @@ class DeepseekV4MoE(nn.Module):
         self.layer_id = layer_id
         self.dim = config.hidden_size
 
-        # TP-aware: with world_size=1, all experts are local.
+        # Expert parallelism: shard the 256 routed experts across EP ranks.
+        # Single-process / no-distributed -> ep_world_size=1 (all local).
+        ep_rank, ep_world_size = _get_moe_ep_rank_world_size()
+        self.ep_rank = ep_rank
+        self.ep_world_size = ep_world_size
+
         self.n_routed_experts = config.n_routed_experts
-        self.n_local_experts = config.n_routed_experts  # TODO(phase1-tp): // world_size
+        if config.n_routed_experts % ep_world_size != 0:
+            raise ValueError(
+                f"V4 MoE: n_routed_experts ({config.n_routed_experts}) must be "
+                f"divisible by ep_world_size ({ep_world_size})"
+            )
+        self.n_local_experts = config.n_routed_experts // ep_world_size
         self.n_activated_experts = config.num_experts_per_tok
-        self.experts_start_idx = 0  # TODO(phase1-tp): rank * n_local_experts
-        self.experts_end_idx = self.n_local_experts
+        self.experts_start_idx = ep_rank * self.n_local_experts
+        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         n_shared_experts = getattr(config, "n_shared_experts", 1)
         assert n_shared_experts == 1, (
             f"V4 expects exactly 1 shared expert per layer; config has {n_shared_experts}"
@@ -1589,8 +1614,17 @@ class DeepseekV4MoE(nn.Module):
             idx, top = torch.where(indices == i)
             y[idx] = y[idx] + expert(x_flat[idx], weights[idx, top, None])
 
-        # TP all_reduce stub (world_size=1 -> noop). TODO(phase1-tp).
-        # if world_size > 1: dist.all_reduce(y)
+        # Cross-rank reduce: sum the partial expert outputs across EP ranks
+        # so every rank sees the full routed-expert sum before adding the
+        # shared expert. No-op when ep_world_size=1.
+        if self.ep_world_size > 1:
+            try:
+                import torch.distributed as dist
+                from sglang.srt.distributed.parallel_state import get_tp_group
+                group = get_tp_group()
+                dist.all_reduce(y, group=group)
+            except Exception:
+                pass
 
         # Shared expert: always-on; runs on every token.
         y = y + self.shared_experts(x_flat)
