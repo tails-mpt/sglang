@@ -173,6 +173,15 @@ class LlamaModel(nn.Module):
             positions = forward_batch.mrope_positions
 
         hidden_states = forward_batch.spec_info.hidden_states
+        # Cast aux hidden_states to match FC weight dtype.
+        # FP8 target models produce float32 dequantized aux states, but the
+        # Eagle3 draft head's FC is bfloat16 — without this cast, F.linear
+        # raises "expected mat1 and mat2 to have the same dtype" during CUDA
+        # graph capture. Originally landed as cfbffdc56 (Gus, 2026-04-01);
+        # subsequently lost in ea2f129a9 (upstream sync). Re-applying as the
+        # durable fix.
+        if hidden_states.dtype != self.fc.weight.dtype:
+            hidden_states = hidden_states.to(self.fc.weight.dtype)
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
 
