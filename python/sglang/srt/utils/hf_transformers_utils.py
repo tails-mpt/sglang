@@ -286,6 +286,45 @@ def _load_deepseek_v32_model(
     )
 
 
+# Temporary hack for DeepSeek-V4 model.
+# transformers (4.57.x) has no `deepseek_v4` model_type, so AutoConfig fails.
+# Same pattern as _load_deepseek_v32_model: rewrite to deepseek_v3 at load time;
+# extra V4-specific fields (compress_ratios, hc_*, q_lora_rank, ...) are
+# preserved on the config object as attributes for our DeepseekV4ForCausalLM
+# model class to consume.
+def _load_deepseek_v4_model(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    local_path = download_from_hf(model_path)
+    config_file = os.path.join(local_path, "config.json")
+    if not os.path.exists(config_file):
+        raise RuntimeError(f"Can't find config file in {local_path}.")
+
+    with open(config_file, "r") as f:
+        config_json = json.load(f)
+
+    # Preserve the original fields under a backup key so the V4 model class
+    # can still detect "this was originally deepseek_v4".
+    config_json["_original_model_type"] = config_json.get("model_type", "deepseek_v4")
+    config_json["_original_architectures"] = config_json.get("architectures", ["DeepseekV4ForCausalLM"])
+    config_json["architectures"] = ["DeepseekV3ForCausalLM"]
+    config_json["model_type"] = "deepseek_v3"
+
+    tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
+    os.makedirs(tmp_path, exist_ok=True)
+
+    unique_path = os.path.join(tmp_path, f"deepseek_v4_{os.getpid()}")
+    with open(unique_path, "w") as f:
+        json.dump(config_json, f)
+
+    return AutoConfig.from_pretrained(
+        unique_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+    )
+
+
 # Temporary hack for Mistral Large
 @lru_cache(maxsize=2)
 def _load_mistral_large_3_for_causal_LM(
@@ -515,19 +554,31 @@ def get_config(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
             )
         except ValueError as e:
-            if not "deepseek_v32" in str(e):
+            if "deepseek_v32" in str(e):
+                config = _load_deepseek_v32_model(
+                    model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+                )
+            elif "deepseek_v4" in str(e):
+                config = _load_deepseek_v4_model(
+                    model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+                )
+            else:
                 raise e
-            config = _load_deepseek_v32_model(
-                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-            )
         except KeyError as e:
             # Transformers v5 may register a built-in config class that
             # conflicts with sglang's custom one (e.g. NemotronHConfig
             # doesn't handle '-' in hybrid_override_pattern). Fall back
             # to loading the raw config dict and using sglang's class.
-            # Also handle deepseek_v32 which v5 doesn't recognize.
+            # Also handle deepseek_v32 / deepseek_v4 which v5 doesn't recognize.
             if "deepseek_v32" in str(e):
                 config = _load_deepseek_v32_model(
+                    model,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            elif "deepseek_v4" in str(e):
+                config = _load_deepseek_v4_model(
                     model,
                     trust_remote_code=trust_remote_code,
                     revision=revision,
