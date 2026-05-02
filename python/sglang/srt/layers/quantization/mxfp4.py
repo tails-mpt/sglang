@@ -395,7 +395,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
-        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        # Annotate scale params with the FusedMoE quant_method enum (GROUP =
+        # per-K-group, the MXFP4 layout: 1 e8m0 byte per 32 elements along K).
+        # Without this, FusedMoE._weight_loader_impl raises ValueError when
+        # the per-expert load path is used (it dispatches on
+        # `getattr(param, "quant_method", None)`).
+        from sglang.srt.layers.moe.fused_moe_triton import (
+            FusedMoeWeightScaleSupported,
+        )
+        scale_attrs = {**(extra_weight_attrs or {}), "quant_method": FusedMoeWeightScaleSupported.GROUP.value}
+        set_weight_attrs(w13_weight_scale, scale_attrs)
 
         w13_weight_bias = torch.nn.Parameter(
             torch.zeros(
@@ -431,7 +440,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, scale_attrs)
 
         w2_weight_bias = torch.nn.Parameter(
             torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
