@@ -490,6 +490,32 @@ def select_top_k_tokens(
         expand_scores = torch.mul(
             scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
         )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
+
+        # Crucible Squeeze Track-A A3.1 (confidence-gated tree pruning).
+        # When --speculative-confidence-prune-factor > 0, mask the children of
+        # parents whose joint score is < prune_factor * max-joint-in-batch.
+        # Effectively prunes entire subtrees rooted at low-confidence parents.
+        # Padded variant: tensor shape (b, topk, topk) preserved; dead children
+        # get -inf joint score so the next fast_topk excludes them naturally.
+        try:
+            _sa = get_global_server_args()
+            _prune_factor = float(getattr(_sa, "speculative_confidence_prune_factor", 0.0))
+        except Exception:
+            _prune_factor = 0.0
+        if _prune_factor > 0.0:
+            # `scores` has shape (b, topk) — joint score per parent (running probability).
+            # Parents whose joint score is below threshold get their (topk) children masked.
+            _max_joint = scores.amax(dim=-1, keepdim=True)  # (b, 1)
+            _alive = scores >= (_prune_factor * _max_joint)  # (b, topk) bool
+            # Mask: for each (batch, parent_topk_index, child_topk_index), if the parent
+            # isn't alive, set the child's score to -inf
+            _mask = _alive.unsqueeze(-1).expand_as(expand_scores)  # (b, topk, topk)
+            expand_scores = torch.where(
+                _mask,
+                expand_scores,
+                torch.full_like(expand_scores, float("-inf")),
+            )
+
         topk_cs_p, topk_cs_index = fast_topk(
             expand_scores.flatten(start_dim=1), topk, dim=-1
         )  # (b, topk)

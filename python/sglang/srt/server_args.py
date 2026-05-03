@@ -505,6 +505,12 @@ class ServerArgs:
     speculative_dflash_draft_window_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    # Crucible Squeeze Track-A A3.1 (confidence-gated tree pruning).
+    # When > 0, parents at speculative tree layer d>=1 whose joint probability
+    # is below `prune_factor * max_joint_in_batch` get their children's joint
+    # scores -inf'd, so the layer's fast_topk effectively prunes that subtree.
+    # 0.0 disables (default — preserves existing behavior).
+    speculative_confidence_prune_factor: float = 0.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
@@ -5094,6 +5100,19 @@ class ServerArgs:
             type=float,
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--speculative-confidence-prune-factor",
+            type=float,
+            default=ServerArgs.speculative_confidence_prune_factor,
+            help=(
+                "Crucible Squeeze A3.1 confidence-gated tree pruning. When > 0, "
+                "parents at layer d>=1 whose joint score is below "
+                "`prune_factor * max_joint_in_batch` get their children's "
+                "joint scores -inf'd. 0.0 disables (default). 0.5 is a good "
+                "starting point: aggressive enough to prune dead branches, "
+                "conservative enough to keep weak-but-correct paths."
+            ),
         )
         parser.add_argument(
             "--speculative-token-map",
