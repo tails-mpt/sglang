@@ -145,5 +145,27 @@ class Ministral3ForCausalLM(LlamaForCausalLM):
     ):
         return Ministral3Model(config, quant_config, prefix=prefix)
 
+    def load_weights(self, weights):
+        # Mistral-Medium-3.5 is published under the multimodal
+        # Mistral3ForConditionalGeneration wrapper. When loaded with the
+        # text-only `architectures: ["Ministral3ForCausalLM"]` override
+        # (per CLAUDE.md rule #26 for Eagle3 training), the safetensors
+        # still have keys prefixed `model.language_model.*`. Strip that
+        # prefix before forwarding to LlamaForCausalLM.load_weights so the
+        # decoder layers actually load instead of staying random-init.
+        # Skip vision_tower / multi_modal_projector tensors entirely
+        # (text-only inference).
+        def _stripped():
+            for name, w in weights:
+                if name.startswith("model.vision_tower") or name.startswith(
+                    "model.multi_modal_projector"
+                ):
+                    continue
+                if name.startswith("model.language_model."):
+                    name = "model." + name[len("model.language_model.") :]
+                yield (name, w)
+
+        return super().load_weights(_stripped())
+
 
 EntryClass = [Ministral3ForCausalLM]
