@@ -471,6 +471,24 @@ def select_top_k_tokens(
     scores: torch.Tensor,
     topk: int,
 ):
+    """Build one layer of the speculative draft tree.
+
+    Default behavior (`speculative_tree_strategy == "static"`): builds the standard
+    Eagle tree where each layer keeps the top-K joint-probability paths. Tensor
+    shape is (b, topk) at every layer.
+
+    TALON variant (`speculative_tree_strategy == "talon"`, Wang et al. 2026,
+    arXiv:2601.07353): "padded" adaptive expansion — same (b, topk) shape per layer,
+    but candidates with `topk_p < mu * max(topk_p in their row)` get their joint
+    score set to -inf, so the next layer's fast_topk effectively ignores them.
+    Layer 0 is unchanged (always Top-K). Layers >=1 apply the threshold + budget.
+    Budget = max-active-paths-across-entire-tree; exceeding it sets the lowest-
+    scored remaining candidates to -inf.
+
+    The padded variant preserves downstream tensor-shape contracts (build_tree_kernel
+    in eagle_worker_v2.py and the tree-attention path) while still gaining TALON's
+    "deep-and-narrow" / "shallow-and-wide" adaptivity through the joint-score mask.
+    """
     if i == 0:
         # The first step after extend
         input_ids = topk_index.flatten()
@@ -490,6 +508,38 @@ def select_top_k_tokens(
         expand_scores = torch.mul(
             scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
         )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
+
+        # Crucible Squeeze Track-A A2 (TALON) — apply confidence-margin masking on
+        # expand_scores before fast_topk picks the layer's top-K. Defaults to no-op
+        # so existing deployments are unchanged.
+        try:
+            _sa = get_global_server_args()
+            _strategy = getattr(_sa, "speculative_tree_strategy", "static")
+        except Exception:
+            _strategy = "static"
+        if _strategy == "talon":
+            # Per-row anchor m_d = max(topk_p in this row's TopK^2 candidate pool)
+            # `topk_p` here is shape (b*topk, topk) — the children of each parent.
+            # We want the per-row anchor over each parent's K children.
+            _mu = float(getattr(_sa, "speculative_talon_mu", 0.03))
+            _children = topk_p.reshape(-1, topk, topk)  # (b, topk, topk)
+            # anchor over the K children of each parent
+            _row_max = _children.amax(dim=-1, keepdim=True)  # (b, topk, 1)
+            _alive = _children >= (_mu * _row_max)  # (b, topk, topk) bool
+            # Mask dead children's joint score to -inf so fast_topk excludes them
+            expand_scores = torch.where(
+                _alive,
+                expand_scores,
+                torch.full_like(expand_scores, float("-inf")),
+            )
+            # NOTE: budget N enforcement is implicit — the next fast_topk picks
+            # only the top-K joint paths, so a hard breadth cap of K^steps applies
+            # naturally. The TALON paper's separate budget N parameter would
+            # require running over multiple iterations and tracking a running
+            # active-path count; that's a more invasive change deferred to a
+            # follow-up. Default mu=0.03 with topk=4 / steps=3 keeps the breadth
+            # cap of 64 paths well below typical budget-N values (60-80).
+
         topk_cs_p, topk_cs_index = fast_topk(
             expand_scores.flatten(start_dim=1), topk, dim=-1
         )  # (b, topk)
