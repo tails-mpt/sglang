@@ -516,29 +516,37 @@ def select_top_k_tokens(
             _sa = get_global_server_args()
             _strategy = getattr(_sa, "speculative_tree_strategy", "static")
         except Exception:
+            _sa = None
             _strategy = "static"
         if _strategy == "talon":
-            # Per-row anchor m_d = max(topk_p in this row's TopK^2 candidate pool)
-            # `topk_p` here is shape (b*topk, topk) — the children of each parent.
-            # We want the per-row anchor over each parent's K children.
             _mu = float(getattr(_sa, "speculative_talon_mu", 0.03))
             _children = topk_p.reshape(-1, topk, topk)  # (b, topk, topk)
-            # anchor over the K children of each parent
             _row_max = _children.amax(dim=-1, keepdim=True)  # (b, topk, 1)
-            _alive = _children >= (_mu * _row_max)  # (b, topk, topk) bool
-            # Mask dead children's joint score to -inf so fast_topk excludes them
+            _alive_talon = _children >= (_mu * _row_max)  # (b, topk, topk) bool
             expand_scores = torch.where(
-                _alive,
+                _alive_talon,
                 expand_scores,
                 torch.full_like(expand_scores, float("-inf")),
             )
-            # NOTE: budget N enforcement is implicit — the next fast_topk picks
-            # only the top-K joint paths, so a hard breadth cap of K^steps applies
-            # naturally. The TALON paper's separate budget N parameter would
-            # require running over multiple iterations and tracking a running
-            # active-path count; that's a more invasive change deferred to a
-            # follow-up. Default mu=0.03 with topk=4 / steps=3 keeps the breadth
-            # cap of 64 paths well below typical budget-N values (60-80).
+
+        # Crucible Squeeze Track-A A3.1 (confidence-gated tree pruning).
+        # When --speculative-confidence-prune-factor > 0, mask the children of
+        # parents whose joint score is < prune_factor * max-joint-in-batch.
+        try:
+            if _sa is None:
+                _sa = get_global_server_args()
+            _prune_factor = float(getattr(_sa, "speculative_confidence_prune_factor", 0.0))
+        except Exception:
+            _prune_factor = 0.0
+        if _prune_factor > 0.0:
+            _max_joint = scores.amax(dim=-1, keepdim=True)  # (b, 1)
+            _alive_conf = scores >= (_prune_factor * _max_joint)  # (b, topk) bool
+            _mask = _alive_conf.unsqueeze(-1).expand_as(expand_scores)  # (b, topk, topk)
+            expand_scores = torch.where(
+                _mask,
+                expand_scores,
+                torch.full_like(expand_scores, float("-inf")),
+            )
 
         topk_cs_p, topk_cs_index = fast_topk(
             expand_scores.flatten(start_dim=1), topk, dim=-1

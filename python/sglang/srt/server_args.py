@@ -506,21 +506,20 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     # Track-B Squeeze: relaxed verification via Medusa-style typical-acceptance.
-    # When `speculative_verify_mode == "typical_acceptance"`, both threshold knobs above
-    # are overridden by `speculative_typical_acceptance_alpha` at verify time.
-    # Default `rejection_sampling` preserves existing strict behavior.
     speculative_verify_mode: Literal[
         "rejection_sampling", "typical_acceptance"
     ] = "rejection_sampling"
     speculative_typical_acceptance_alpha: float = 0.8
     # Crucible Squeeze Track-A A2 (TALON adaptive tree, arXiv:2601.07353).
-    # When `speculative_tree_strategy == "talon"`, layers >=1 of the speculative
-    # draft tree apply a per-row confidence-margin filter: candidates with
-    # `topk_p < mu * max(topk_p in row)` get -inf joint score (effectively
-    # pruned by the next fast_topk). Lossless — verification math unchanged.
     speculative_tree_strategy: str = "static"  # "static" or "talon"
     speculative_talon_mu: float = 0.03  # confidence-margin coefficient
     speculative_talon_budget: int = 60  # max active paths cap (loose; informational)
+    # Crucible Squeeze Track-A A3.1 (confidence-gated tree pruning).
+    # When > 0, parents at speculative tree layer d>=1 whose joint probability
+    # is below `prune_factor * max_joint_in_batch` get their children's joint
+    # scores -inf'd, so the layer's fast_topk effectively prunes that subtree.
+    # 0.0 disables (default — preserves existing behavior).
+    speculative_confidence_prune_factor: float = 0.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
@@ -5176,6 +5175,19 @@ class ServerArgs:
                 "topk^steps applies via the per-layer fast_topk; an explicit "
                 "running-budget enforcement is deferred to a follow-up. Default "
                 "60 from the TALON paper."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-confidence-prune-factor",
+            type=float,
+            default=ServerArgs.speculative_confidence_prune_factor,
+            help=(
+                "Crucible Squeeze A3.1 confidence-gated tree pruning. When > 0, "
+                "parents at layer d>=1 whose joint score is below "
+                "`prune_factor * max_joint_in_batch` get their children's "
+                "joint scores -inf'd. 0.0 disables (default). 0.5 is a good "
+                "starting point: aggressive enough to prune dead branches, "
+                "conservative enough to keep weak-but-correct paths."
             ),
         )
         parser.add_argument(
