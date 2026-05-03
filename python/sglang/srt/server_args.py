@@ -513,6 +513,14 @@ class ServerArgs:
         "rejection_sampling", "typical_acceptance"
     ] = "rejection_sampling"
     speculative_typical_acceptance_alpha: float = 0.8
+    # Crucible Squeeze Track-A A2 (TALON adaptive tree, arXiv:2601.07353).
+    # When `speculative_tree_strategy == "talon"`, layers >=1 of the speculative
+    # draft tree apply a per-row confidence-margin filter: candidates with
+    # `topk_p < mu * max(topk_p in row)` get -inf joint score (effectively
+    # pruned by the next fast_topk). Lossless — verification math unchanged.
+    speculative_tree_strategy: str = "static"  # "static" or "talon"
+    speculative_talon_mu: float = 0.03  # confidence-margin coefficient
+    speculative_talon_budget: int = 60  # max active paths cap (loose; informational)
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
@@ -5129,6 +5137,45 @@ class ServerArgs:
                 "Alpha threshold for typical_acceptance verify mode. Ignored when "
                 "--speculative-verify-mode is rejection_sampling. Range (0, 1]. "
                 "Smaller values -> higher accept rate, lower distributional fidelity."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-tree-strategy",
+            type=str,
+            choices=["static", "talon"],
+            default=ServerArgs.speculative_tree_strategy,
+            help=(
+                "Speculative draft tree construction strategy. 'static' (default) "
+                "builds the standard fixed-shape Eagle tree where each layer keeps "
+                "the top-K joint paths. 'talon' applies TALON adaptive expansion "
+                "(arXiv:2601.07353): at layers >=1, candidates whose probability "
+                "is below mu * max-in-row get -inf joint score (effectively "
+                "pruned). Lossless — only changes tree topology; verification "
+                "math is unchanged. Padded variant: tensor shapes unchanged at "
+                "every layer."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-talon-mu",
+            type=float,
+            default=ServerArgs.speculative_talon_mu,
+            help=(
+                "Confidence-margin coefficient for --speculative-tree-strategy=talon. "
+                "Candidates with p < mu * max-in-row get pruned. Default 0.03 from "
+                "the TALON paper Section 6.1. Higher mu = more aggressive pruning "
+                "(narrower trees). Range (0, 1]."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-talon-budget",
+            type=int,
+            default=ServerArgs.speculative_talon_budget,
+            help=(
+                "Max active path cap for --speculative-tree-strategy=talon. "
+                "Currently informational only — the natural breadth cap of "
+                "topk^steps applies via the per-layer fast_topk; an explicit "
+                "running-budget enforcement is deferred to a follow-up. Default "
+                "60 from the TALON paper."
             ),
         )
         parser.add_argument(
