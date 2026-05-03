@@ -505,6 +505,11 @@ class ServerArgs:
     speculative_dflash_draft_window_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    # Crucible Squeeze Track-A A3.2 (per-prompt-class tree-config routing).
+    # Path to a JSON file mapping prompt_class -> {num_steps, eagle_topk,
+    # num_draft_tokens}. None disables (existing global behavior).
+    # SCAFFOLD: server arg lives; eagle_worker routing hook is deferred.
+    speculative_routing_config: Optional[str] = None
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
@@ -5094,6 +5099,19 @@ class ServerArgs:
             type=float,
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--speculative-routing-config",
+            type=str,
+            default=ServerArgs.speculative_routing_config,
+            help=(
+                "Crucible Squeeze A3.2 per-prompt-class tree-config routing. "
+                "Path to a JSON file mapping prompt_class -> "
+                "{num_steps, eagle_topk, num_draft_tokens}. None disables "
+                "(default — existing global config). When set, the "
+                "eagle_worker classifies each request's prompt at request "
+                "time (rule-based) and uses the per-class config."
+            ),
         )
         parser.add_argument(
             "--speculative-token-map",
