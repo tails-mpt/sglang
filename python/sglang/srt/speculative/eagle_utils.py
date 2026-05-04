@@ -169,6 +169,12 @@ def verify_tree_greedy_func(
     target_predict: torch.Tensor,
     topk: int = -1,
 ):
+    # The verify_tree_greedy CUDA kernel mandates int64 for candidates. With
+    # quantized drafts (FP8) or certain attention backends the upstream draft
+    # path occasionally produces int32 token IDs, which the kernel rejects with
+    # "Expected 'candidates' to be of type long (torch.int64)". Cast defensively.
+    if candidates.dtype != torch.int64:
+        candidates = candidates.to(torch.int64)
     if _is_cuda or _is_hip:
         from sgl_kernel import verify_tree_greedy
 
