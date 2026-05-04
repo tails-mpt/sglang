@@ -99,6 +99,23 @@ class EAGLEWorker(TpModelWorker):
         self.device = server_args.device
         self.target_worker = target_worker
         self.page_size = server_args.page_size
+
+        # A3.1 — confidence-gated tree pruning monitor.
+        # Tracks an EMA of average accept length per forward. When EMA falls below
+        # the floor, logs a recommendation to lower topk (operator can tune).
+        # We do NOT auto-mutate self.topk — that would invalidate captured cuda
+        # graphs which were built for a fixed topk. Per-request adaptation is
+        # left as future work (would require a graphless fast path).
+        # Disabled by default (floor == 0.0).
+        self._a31_topk_initial = self.topk
+        self._a31_floor = float(server_args.speculative_adaptive_topk_floor)
+        self._a31_recovery = float(server_args.speculative_adaptive_topk_recovery)
+        self._a31_window = int(server_args.speculative_adaptive_topk_window)
+        self._a31_alpha = float(server_args.speculative_adaptive_topk_alpha)
+        self._a31_ema_accept_len = float(self.speculative_num_steps)  # optimistic init
+        self._a31_below_floor_streak = 0
+        self._a31_above_recovery_streak = 0
+        self._a31_n_forwards = 0
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -332,6 +349,10 @@ class EAGLEWorker(TpModelWorker):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
 
+            # A3.1 — update EMA + log topk recommendation if floor configured.
+            if self._a31_floor > 0.0 and verify_output.accept_length_per_req_cpu:
+                self._a31_observe(verify_output.accept_length_per_req_cpu)
+
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=verify_output.verified_id,
@@ -339,6 +360,53 @@ class EAGLEWorker(TpModelWorker):
                 accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
+
+    def _a31_observe(self, accept_lengths_cpu) -> None:
+        """A3.1 — confidence-gated tree pruning monitor.
+
+        Updates the EMA of average accept length and logs a recommendation when
+        the EMA crosses the floor for `window` consecutive forwards. We do NOT
+        mutate self.topk here (cuda graphs are captured for fixed topk and
+        mutating would invalidate them). The recommendation goes to the standard
+        sglang logger and to Prometheus if metrics are enabled.
+        """
+        if not accept_lengths_cpu:
+            return
+        batch_avg = sum(accept_lengths_cpu) / len(accept_lengths_cpu)
+        a = self._a31_alpha
+        self._a31_ema_accept_len = a * batch_avg + (1.0 - a) * self._a31_ema_accept_len
+        self._a31_n_forwards += 1
+
+        if self._a31_ema_accept_len < self._a31_floor:
+            self._a31_below_floor_streak += 1
+            self._a31_above_recovery_streak = 0
+            if self._a31_below_floor_streak == self._a31_window:
+                # First time crossing — log a recommendation
+                logger.warning(
+                    "[A3.1] EMA accept length %.2f < floor %.2f for %d consecutive forwards. "
+                    "Consider lowering topk from %d to %d.",
+                    self._a31_ema_accept_len,
+                    self._a31_floor,
+                    self._a31_below_floor_streak,
+                    self.topk,
+                    max(1, self.topk // 2),
+                )
+        else:
+            self._a31_below_floor_streak = 0
+            if self._a31_recovery > 0.0 and self._a31_ema_accept_len >= self._a31_recovery:
+                self._a31_above_recovery_streak += 1
+                if (
+                    self._a31_above_recovery_streak == self._a31_window
+                    and self.topk < self._a31_topk_initial
+                ):
+                    logger.info(
+                        "[A3.1] EMA accept length %.2f >= recovery %.2f for %d forwards; "
+                        "consider restoring topk to %d.",
+                        self._a31_ema_accept_len,
+                        self._a31_recovery,
+                        self._a31_above_recovery_streak,
+                        self._a31_topk_initial,
+                    )
 
     def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         local_need_forward = batch.spec_info.verified_id.shape[0] > 0

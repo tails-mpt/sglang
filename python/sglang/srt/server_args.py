@@ -505,6 +505,15 @@ class ServerArgs:
     speculative_dflash_draft_window_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    # A3.1 — confidence-gated tree pruning (Crucible squeeze plan).
+    # When enabled, the eagle worker tracks an EMA of average accept length and
+    # halves topk when the EMA falls below the floor. Defaults to 0.0 (disabled).
+    # Recovery: when EMA recovers above the recovery threshold for >= recovery_window
+    # forward passes, restore topk to its initial value.
+    speculative_adaptive_topk_floor: float = 0.0
+    speculative_adaptive_topk_recovery: float = 0.0
+    speculative_adaptive_topk_window: int = 32
+    speculative_adaptive_topk_alpha: float = 0.1  # EMA smoothing
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
@@ -5094,6 +5103,34 @@ class ServerArgs:
             type=float,
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--speculative-adaptive-topk-floor",
+            type=float,
+            help="A3.1 — Confidence-gated tree pruning. When the EMA of average accept length "
+            "falls below this floor (e.g. 1.5), halve topk for subsequent forward passes. "
+            "0.0 (default) disables adaptation.",
+            default=ServerArgs.speculative_adaptive_topk_floor,
+        )
+        parser.add_argument(
+            "--speculative-adaptive-topk-recovery",
+            type=float,
+            help="A3.1 — recovery threshold. When EMA accept length climbs back above this "
+            "for `--speculative-adaptive-topk-window` consecutive forwards, restore topk to "
+            "its initial value. Should be > floor. 0.0 (default) means never recover.",
+            default=ServerArgs.speculative_adaptive_topk_recovery,
+        )
+        parser.add_argument(
+            "--speculative-adaptive-topk-window",
+            type=int,
+            help="A3.1 — number of consecutive forwards above recovery threshold before topk is restored.",
+            default=ServerArgs.speculative_adaptive_topk_window,
+        )
+        parser.add_argument(
+            "--speculative-adaptive-topk-alpha",
+            type=float,
+            help="A3.1 — EMA smoothing factor in [0, 1] for accept-length tracking. Higher = more responsive to recent batches.",
+            default=ServerArgs.speculative_adaptive_topk_alpha,
         )
         parser.add_argument(
             "--speculative-token-map",
