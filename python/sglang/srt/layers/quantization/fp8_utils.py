@@ -444,6 +444,14 @@ def _dispatch_auto_backend() -> Callable:
     # 4. AITER (if AMD GPU with AITER enabled)
     # 5. Triton (fallback)
 
+    # CRUCIBLE: when running inside SpecForge's SGLangRunner (training path),
+    # initialize_fp8_gemm_config is never called (Scheduler-only). Gate on an
+    # env var so the DeepGEMM JIT compiler (crashes on many H100 venvs) can be
+    # bypassed without touching server-mode behavior. Default=1 (bypass).
+    import os as _os
+    if _os.environ.get("CRUCIBLE_DISABLE_DEEPGEMM_AUTO", "1") == "1":
+        return triton_w8a8_block_fp8_linear
+
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
     elif is_blackwell_supported() and is_flashinfer_available():
