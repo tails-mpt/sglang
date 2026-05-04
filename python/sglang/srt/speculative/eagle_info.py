@@ -315,8 +315,24 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
-            target_predict = target_predict.reshape(bs, self.draft_token_num)
+            # B4 — FLy loose verification (Crucible squeeze plan).
+            # Opt-in via env var SGLANG_USE_FLY_VERIFY=1; controlled by
+            # SGLANG_FLY_RELATIVE_THRESHOLD (default 0.8). When enabled, the
+            # target_predict is computed via relative-probability acceptance
+            # instead of strict argmax.
+            import os
+            if os.environ.get("SGLANG_USE_FLY_VERIFY", "0") == "1":
+                from sglang.srt.speculative.fly_verify import relax_target_predict_fly
+                fly_threshold = float(os.environ.get("SGLANG_FLY_RELATIVE_THRESHOLD", "0.8"))
+                target_predict = relax_target_predict_fly(
+                    logits_output.next_token_logits,
+                    candidates,
+                    relative_threshold=fly_threshold,
+                )
+                target_predict = target_predict.reshape(bs, self.draft_token_num)
+            else:
+                target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
+                target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, accept_length = verify_tree_greedy_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
