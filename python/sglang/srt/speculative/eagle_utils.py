@@ -22,6 +22,21 @@ def organize_draft_results(
     parents_list: List[torch.Tensor],
     num_draft_token: int,
 ):
+    # A2 — TALON adaptive tree expansion (opt-in via env var).
+    # When SGLANG_USE_TALON_TREE=1 is set, route to the from-paper TALON
+    # selector instead of the static topk. Defaults to off (existing behavior).
+    import os
+    if os.environ.get("SGLANG_USE_TALON_TREE", "0") == "1":
+        from sglang.srt.speculative.talon_tree import select_talon_tree
+        mu = float(os.environ.get("SGLANG_TALON_MU", "0.03"))
+        return select_talon_tree(
+            score_list,
+            token_list,
+            parents_list,
+            num_draft_token,
+            mu=mu,
+        )
+
     score_list = torch.cat(score_list, dim=1).flatten(1)
     ss_token_list = torch.cat(token_list, dim=1)
     top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
