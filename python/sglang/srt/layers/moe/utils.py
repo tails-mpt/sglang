@@ -168,7 +168,13 @@ def initialize_moe_config(server_args: ServerArgs):
     global MOE_QUANTIZATION
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
-    MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
+    # CRUCIBLE: in SpecForge training path (SGLangRunner, no Scheduler), force
+    # triton when auto is requested to avoid DeepGEMM JIT crashes on H100.
+    import os as _os
+    _moe_backend = server_args.moe_runner_backend
+    if _moe_backend == "auto" and _os.environ.get("CRUCIBLE_DISABLE_DEEPGEMM_AUTO", "1") == "1":
+        _moe_backend = "triton"
+    MOE_RUNNER_BACKEND = MoeRunnerBackend(_moe_backend)
     SPECULATIVE_MOE_RUNNER_BACKEND = (
         MoeRunnerBackend(server_args.speculative_moe_runner_backend)
         if server_args.speculative_moe_runner_backend is not None
