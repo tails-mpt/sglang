@@ -20,9 +20,12 @@ from sglang.srt.utils import add_prefix
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
 
 import copy
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
 from torch import nn
 from transformers import LlamaConfig
 
@@ -80,6 +83,13 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        # FP8 fix extension: cast embeds to match hidden_states dtype before
+        # concat. FP8 target models can produce float32 embeds while the
+        # draft's hidden_states is bfloat16 (post the fc-cast in LlamaModel.forward).
+        # Without this, torch.cat upcasts to float32 and downstream linear ops fail.
+        if embeds.dtype != hidden_states.dtype:
+            embeds = embeds.to(hidden_states.dtype)
 
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
@@ -173,13 +183,10 @@ class LlamaModel(nn.Module):
             positions = forward_batch.mrope_positions
 
         hidden_states = forward_batch.spec_info.hidden_states
-        # Cast aux hidden_states to match FC weight dtype.
-        # FP8 target models produce float32 dequantized aux states, but the
-        # Eagle3 draft head's FC is bfloat16 — without this cast, F.linear
-        # raises "expected mat1 and mat2 to have the same dtype" during CUDA
-        # graph capture. Originally landed as cfbffdc56 (Gus, 2026-04-01);
-        # subsequently lost in ea2f129a9 (upstream sync). Re-applying as the
-        # durable fix.
+        # FP8 fix (sglang fork commit 71e0bf009): FP8 target models produce
+        # float32 dequantized aux hidden states; the Eagle3 draft FC is bf16.
+        # Without this cast, F.linear raises a dtype mismatch during CUDA
+        # graph capture.
         if hidden_states.dtype != self.fc.weight.dtype:
             hidden_states = hidden_states.to(self.fc.weight.dtype)
         if hidden_states.shape[-1] != embeds.shape[-1]:
@@ -219,7 +226,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.pp_group = get_pp_group()
 
         if self.config.num_hidden_layers != 1:
-            raise ValueError("EAGLE3 currently only supports 1 layer")
+            logger.warning(f"Multi-layer EAGLE3 drafter (num_hidden_layers={self.config.num_hidden_layers}) — depth-ablation patch by tails-mpt fork")
 
         self.model = LlamaModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
