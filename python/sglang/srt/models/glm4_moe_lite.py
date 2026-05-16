@@ -463,6 +463,14 @@ class Glm4MoeLiteModel(DeepseekV2Model):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
         self.layers_to_capture = []
+        # Mirror DeepseekV2Model: forward() reads self.enable_a2a_moe before
+        # routing through dense vs MoE layers. We bypass DeepseekV2Model.__init__
+        # (calling nn.Module.__init__ directly above), so we set it ourselves
+        # using the same backend probe.
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+            self.enable_a2a_moe = True
+        else:
+            self.enable_a2a_moe = False
 
 
 class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
