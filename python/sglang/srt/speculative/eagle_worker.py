@@ -5,6 +5,11 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    get_world_group,
+    init_model_parallel_group,
+)
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
@@ -148,9 +153,63 @@ class EAGLEWorker(TpModelWorker):
         else:
             self.hot_token_id = None
 
+        # Drafter TP override (see docs/theory/drafter-tp-bottleneck.md).
+        # When `speculative_draft_tp_size` differs from the target TP, build a
+        # separate GroupCoordinator for the drafter. The size-1 case (replicate
+        # the drafter on every rank) is the load-bearing one — it eliminates
+        # the per-layer all-reduce inside the drafter that drives the Eagle3
+        # TTFT regression at TP>1.
+        #
+        # Implementation: we construct the group BEFORE super().__init__(), and
+        # rely on the existing draft_tp_context() / patch_tensor_parallel_group()
+        # machinery to swap the global _TP during draft init + draft forward.
+        # The drafter's ModelRunner captures tp_group from the patched _TP at
+        # init time, so subsequent forwards naturally use the right group.
+        self.draft_tp_group_override: Optional[GroupCoordinator] = None
+        draft_tp_size = server_args.speculative_draft_tp_size
+        target_tp_size = server_args.tp_size
+        if draft_tp_size is not None and draft_tp_size != target_tp_size:
+            if draft_tp_size != 1:
+                # v1: only the "replicate" case is supported. N-rank sub-groups
+                # would require sub-group construction that respects the target's
+                # rank layout — deferred.
+                raise NotImplementedError(
+                    f"--speculative-draft-tp-size={draft_tp_size} is not yet "
+                    f"supported; only 1 (replicate) is implemented. "
+                    f"Target tp_size={target_tp_size}."
+                )
+            if server_args.enable_dp_attention:
+                # The existing DP-attention path patches _TP with the attention
+                # TP group; double-patching would trip the _TP_STATE_PATCHED
+                # assertion. Defer combining the two until a real need arises.
+                raise NotImplementedError(
+                    "--speculative-draft-tp-size cannot be combined with "
+                    "--enable-dp-attention in this revision."
+                )
+            world_group = get_world_group()
+            tp_group = get_tp_group()
+            # Per-rank singleton groups: rank r is the only member of its own
+            # draft TP group. NCCL will create N comm streams (one per rank);
+            # each is a no-op for all-reduce since size = 1.
+            group_ranks = [[r] for r in tp_group.ranks]
+            backend = torch.distributed.get_backend(world_group.device_group)
+            self.draft_tp_group_override = init_model_parallel_group(
+                group_ranks=group_ranks,
+                local_rank=world_group.local_rank,
+                backend=backend,
+                group_name="draft_tp_replicated",
+            )
+            logger.info(
+                "Built draft TP group of size 1 (replicate); drafter will skip "
+                "all-reduce. target_tp=%d, draft_tp=1.",
+                target_tp_size,
+            )
+
         # Init draft worker
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_attention_tp_group())
+        elif self.draft_tp_group_override is not None:
+            ctx = draft_tp_context(self.draft_tp_group_override)
         else:
             ctx = empty_context()
         with (
@@ -173,6 +232,36 @@ class EAGLEWorker(TpModelWorker):
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+
+        # In replicated-drafter mode, the drafter expects FULL vocab embed/head
+        # tensors (its VocabParallelEmbedding / ParallelLMHead were instantiated
+        # under a patched _TP of size 1). But the target's get_embed_and_head()
+        # returns the target's per-rank shards (sharded over vocab dim). We must
+        # all-gather across the target's TP group to materialize the full
+        # tensors per rank before set_embed_and_head().
+        if self.draft_tp_group_override is not None:
+            target_tp_group = get_tp_group()  # outside draft_tp_context here
+            target_tp_size = target_tp_group.world_size
+            if target_tp_size > 1:
+                def _all_gather_vocab_dim(t: torch.Tensor) -> torch.Tensor:
+                    # ParallelLMHead / VocabParallelEmbedding shard vocab on
+                    # dim 0 (rows); gather concatenates the per-rank slices.
+                    full = torch.empty(
+                        (t.shape[0] * target_tp_size, *t.shape[1:]),
+                        dtype=t.dtype,
+                        device=t.device,
+                    )
+                    torch.distributed.all_gather_into_tensor(
+                        full, t.contiguous(), group=target_tp_group.device_group
+                    )
+                    return full
+                embed = _all_gather_vocab_dim(embed)
+                head = _all_gather_vocab_dim(head)
+                logger.info(
+                    "Replicated drafter: all-gathered embed+head across target "
+                    "TP=%d. Per-rank embed shape=%s, head shape=%s.",
+                    target_tp_size, tuple(embed.shape), tuple(head.shape),
+                )
 
         if self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head
@@ -204,8 +293,17 @@ class EAGLEWorker(TpModelWorker):
         self.draft_model_runner.server_args.disable_cuda_graph = (
             backup_disable_cuda_graph
         )
+        # When either DP-attention or the draft TP override is active, the
+        # drafter forward needs to run under draft_tp_context so the global
+        # _TP is patched to the drafter's group for the duration of the call.
+        # Otherwise the forward inherits the target's TP group (current default).
         self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
+            draft_tp_context
+            if (
+                server_args.enable_dp_attention
+                or self.draft_tp_group_override is not None
+            )
+            else empty_context
         )
         self.eagle_use_aux_hidden_state = False
         if self.speculative_algorithm.is_eagle3():

@@ -498,6 +498,11 @@ class ServerArgs:
     speculative_draft_model_path: Optional[str] = None
     speculative_draft_model_revision: Optional[str] = None
     speculative_draft_load_format: Optional[str] = None
+    # Drafter TP override. None → drafter inherits target tp_size (existing behavior).
+    # 1 → drafter is REPLICATED on every rank (no per-layer all-reduce inside the
+    # drafter); the load-bearing fix for the Eagle3 TTFT regression at TP>1 — see
+    # docs/theory/drafter-tp-bottleneck.md. vLLM's analog: draft_tensor_parallel_size.
+    speculative_draft_tp_size: Optional[int] = None
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -5066,6 +5071,17 @@ class ServerArgs:
             help="The format of the draft model weights to load. "
             "If not specified, will use the same format as --load-format. "
             "Use 'dummy' to initialize draft model weights with random values for profiling.",
+        )
+        parser.add_argument(
+            "--speculative-draft-tp-size",
+            type=int,
+            default=ServerArgs.speculative_draft_tp_size,
+            help="Tensor-parallel size for the drafter, independent of the target's "
+            "--tp. Defaults to the target tp_size (existing behavior, drafter is "
+            "TP-sharded). Set to 1 to REPLICATE the drafter on every rank — "
+            "eliminates the per-layer all-reduce inside the drafter, recovering "
+            "Eagle3 TTFT lost to comm overhead at TP>1. vLLM's analog: "
+            "draft_tensor_parallel_size. See docs/theory/drafter-tp-bottleneck.md.",
         )
         parser.add_argument(
             "--speculative-num-steps",

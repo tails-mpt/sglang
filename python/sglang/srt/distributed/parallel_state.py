@@ -2084,24 +2084,33 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     """Patch the tp group temporarily until this function ends.
 
     This method is for draft workers of speculative decoding to run draft model
-    with different tp degree from that of target model workers.
+    with different tp degree from that of target model workers. Patches BOTH
+    `_TP` and `_ATTN_TP` to the provided group so that:
+      - linear layers (Column/RowParallelLinear) read `_TP` to size shards,
+      - KV-cache pool sizing (`get_attention_tp_size()` → `_ATTN_TP.world_size`)
+        is consistent with the patched layer sharding.
+    If `_ATTN_TP` is not patched, layer outputs (e.g. K projection in a
+    replicated drafter) and KV-pool layout disagree, and `set_kv_buffer`'s
+    `view(-1, row_dim)` will fail at cuda-graph capture time.
 
     Args:
         tp_group (GroupCoordinator): the tp group coordinator
     """
-    global _TP_STATE_PATCHED
+    global _TP_STATE_PATCHED, _TP, _ATTN_TP
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
 
     _TP_STATE_PATCHED = True
-    old_tp_group = get_tp_group()
-    global _TP
+    old_tp_group = _TP
+    old_attn_tp_group = _ATTN_TP
     _TP = tp_group
+    _ATTN_TP = tp_group
     try:
         yield
     finally:
         # restore the original state
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
+        _ATTN_TP = old_attn_tp_group
 
 
 def get_world_size():
