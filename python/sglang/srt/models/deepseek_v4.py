@@ -1100,7 +1100,11 @@ class V4Attention(nn.Module):
             rope_factor = config.rope_scaling["factor"]
         else:
             original_seq_len = 0
-            rope_theta = config.rope_theta
+            # transformers 5.x migrates rope_theta into rope_parameters/rope_scaling;
+            # the remapped DeepseekV3Config no longer exposes config.rope_theta directly.
+            rope_theta = getattr(config, "rope_theta", None)
+            if rope_theta is None:
+                rope_theta = config.rope_scaling.get("rope_theta", 10000)
             rope_factor = 1.0
         beta_fast = config.rope_scaling.get("beta_fast", 32)
         beta_slow = config.rope_scaling.get("beta_slow", 1)
