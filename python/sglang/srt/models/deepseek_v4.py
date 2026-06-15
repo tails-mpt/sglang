@@ -1588,6 +1588,8 @@ class DeepseekV4Model(nn.Module):
         self.hc_eps = config.hc_eps
         self.hc_mult = hc_mult = config.hc_mult
         self.norm_eps = config.rms_norm_eps
+        # Eagle3 aux-hidden-state capture (set via DeepseekV4ForCausalLM.set_eagle3_layers_to_capture).
+        self.layers_to_capture = []
         if self.pp_group.is_last_rank:
             hc_dim = hc_mult * config.hidden_size
             self.hc_head_fn = nn.Parameter(
@@ -1673,7 +1675,12 @@ class DeepseekV4Model(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
         prev_residual, prev_post, prev_comb = None, None, None
         last_layer = None
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                # Eagle3: capture this layer's input residual stream, reduced over
+                # the hc_mult mHC copies -> [num_tokens, hidden_size].
+                aux_hidden_states.append(hidden_states.mean(dim=1))
             layer = self.layers[i]
             last_layer = layer
             ctx = (
@@ -1717,6 +1724,8 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.norm(hidden_states)
 
+        if len(aux_hidden_states) > 0:
+            return (hidden_states, pre_hc_head), aux_hidden_states
         return hidden_states, pre_hc_head
 
 
@@ -1803,6 +1812,24 @@ class DeepseekV4ForCausalLM(nn.Module):
             "DeepSeek V4 requires different clamping for shared and routed experts. "
             "Shared experts fusion optimization is disabled.",
         )
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        """Eagle3 target-capture: select which decoder layers' hidden states to
+        return as aux features (mirrors DeepseekV2ForCausalLM). Used by SpecForge
+        online data-gen. For V4-Flash the draft config passes [1, 21, 41]; the
+        leading-1 convention shifts to capture each layer's OUTPUT (+1)."""
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            if layer_ids and layer_ids[0] == 1:
+                self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            else:
+                self.model.layers_to_capture = list(layer_ids)
 
     @torch.no_grad()
     def forward(
