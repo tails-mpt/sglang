@@ -16,7 +16,7 @@
 """Inference-only NemotronH model."""
 
 from collections.abc import Iterable
-from typing import Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -604,6 +604,7 @@ class NemotronHModel(nn.Module):
             self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         else:
             self.norm_f = PPMissingLayer(return_tuple=True)
+        self.layers_to_capture = []
 
     def forward(
         self,
@@ -612,7 +613,7 @@ class NemotronHModel(nn.Module):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, PPProxyTensors]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]:
         if self.pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -624,7 +625,14 @@ class NemotronHModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual
+                    if residual is not None
+                    else hidden_states
+                )
             layer = self.layers[i]
             if not isinstance(layer, Layers):
                 raise ValueError(f"Unknown layer type: {type(layer)}")
@@ -634,12 +642,20 @@ class NemotronHModel(nn.Module):
                 forward_batch=forward_batch,
             )
 
+        # Capture post-loop for the final layer's output (see qwen2.py for explanation).
+        if self.end_layer in self.layers_to_capture:
+            aux_hidden_states.append(hidden_states + residual)
+
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm_f(hidden_states, residual)
-        return hidden_states
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
 
 class NemotronHForCausalLM(nn.Module):
@@ -722,6 +738,8 @@ class NemotronHForCausalLM(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
 
+        self.capture_aux_hidden_states = False
+
     def _init_model(
         self,
         config: NemotronHConfig,
@@ -747,9 +765,18 @@ class NemotronHForCausalLM(nn.Module):
         hidden_states = self.model.forward(
             input_ids, positions, forward_batch, pp_proxy_tensors, input_embeds
         )
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
             )
         else:
             return hidden_states
@@ -770,6 +797,32 @@ class NemotronHForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            # we plus 1 here because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
